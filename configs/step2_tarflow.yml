@@ -1,0 +1,65 @@
+# Config for step2_tarflow.py -- TarFlow training/testing.
+#
+# tarflow_repo: clone of the OFFICIAL github.com/apple/ml-tarflow (model code
+# imported unmodified; commit recorded in outputs provenance).
+
+seed: 20260831
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step2_tarflow
+
+runs:
+  # Exact replication of Apple's released MNIST toy experiment
+  # (train_local.ipynb defaults): class-conditional TarFlow [4-128-4-4],
+  # gaussian noise 0.1, bs 256, lr 2e-3, 100 epochs.
+  mnist_toy:
+    device: cuda:0
+    dataset: mnist
+    conditional: true
+    img_size: 28
+    channel_size: 1
+    hflip: false
+    patch_size: 4
+    channels: 128
+    blocks: 4
+    layers_per_block: 4
+    noise_type: gaussian
+    noise_std: 0.1
+    cfg: 0
+    batch_size: 256
+    lr: 2.0e-3
+    epochs: 100
+    sample_freq: 10
+    sample_rows: 10      # one row per digit class, like the notebook's grid
+    sample_nrow: 10
+    eval_bpd: false      # gaussian-noise model: bpd not meaningful
+    eval_freq: 0
+    classifier_eval: true  # Bayes-rule p(y|x) eval from the notebook
+
+  # Unconditional CIFAR-10 likelihood run in the paper's likelihood style:
+  # uniform dequantization, fp32 (official train.py disables amp for uniform),
+  # patch 2 (as in the ImageNet64 2.99-bpd config), scaled to 1x RTX 4090.
+  # Paper-scale reference: TarFlow [2-768-8-8] on unconditional ImageNet64,
+  # 8x A100, reaches 2.99 bpd; classic CIFAR-10 flows: RealNVP 3.49,
+  # Glow 3.35, Flow++ 3.08 bpd.
+  cifar10_uniform:
+    device: cuda:1
+    dataset: cifar10
+    conditional: false
+    img_size: 32
+    channel_size: 3
+    hflip: true          # official train.py uses RandomHorizontalFlip
+    patch_size: 2
+    channels: 256
+    blocks: 8
+    layers_per_block: 4
+    noise_type: uniform
+    cfg: 0
+    batch_size: 128
+    lr: 2.0e-4
+    epochs: 60
+    sample_freq: 10
+    sample_rows: 8
+    sample_nrow: 8
+    eval_bpd: true
+    eval_freq: 5
+    classifier_eval: false

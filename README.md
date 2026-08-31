@@ -12,10 +12,19 @@ is an exact record of what was run and what it produced.
 
 ```
 step1_datasets.py            datasets + dataloaders (also the step-1 test)
-configs/step1_datasets.yml   config for step 1
-outputs/step1_datasets/      data/ (json, csv, tex fragments) + figures/ (png)
+step2_tarflow.py             TarFlow training/eval (official apple/ml-tarflow model)
+configs/step<N>_*.yml        config per step
+outputs/step<N>_*/           data/ (json, csv, tex fragments) + figures/ (png)
 paper/main.tex               executable methods & results log -> main.pdf
 ```
+
+Step 2 imports the official TarFlow model (`transformer_flow.py`) unmodified
+from a clone of [apple/ml-tarflow](https://github.com/apple/ml-tarflow) at
+`/dev_ws/ml-tarflow` (clone it next to this repo; commit is pinned in the
+step-2 provenance output). Runs: `mnist_toy` (exact replication of Apple's
+train_local.ipynb toy: conditional samples + Bayes classifier eval) and
+`cifar10_uniform` (unconditional likelihood, uniform dequantization, official
+bits/dim formula).
 
 ## Environment
 

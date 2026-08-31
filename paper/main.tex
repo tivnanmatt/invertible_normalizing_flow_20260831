@@ -1,5 +1,6 @@
 \documentclass[11pt]{article}
 \usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{verbatim}
 \usepackage[hidelinks]{hyperref}
@@ -157,6 +158,118 @@ datasets).
         under \texttt{/data/image\_benchmarks}.
 \end{itemize}
 
+\section{Step 2: TarFlow -- Transformer Autoregressive Flow}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Model: TarFlow from \emph{Normalizing Flows are Capable Generative
+        Models} (Zhai et al., Apple, arXiv:2412.06329). A TarFlow is a stack
+        of $T$ causal-ViT ``metablocks'', each an autoregressive NVP flow over
+        image patches; the patch order is flipped between consecutive blocks.
+        Training maximizes exact likelihood; sampling inverts the blocks
+        patch-by-patch with KV caching.
+  \item Code: the \emph{official} implementation
+        (\texttt{github.com/apple/ml-tarflow}, Apple sample-code license) is
+        used unmodified: \texttt{transformer\_flow.py} is imported directly
+        from a clone at \texttt{/dev\_ws/ml-tarflow} (commit hash in
+        \texttt{outputs/step2\_tarflow/data/provenance.json}). Our driver
+        \texttt{step2\_tarflow.py} reimplements the surrounding training loop
+        faithfully to the official \texttt{train.py} /
+        \texttt{train\_local.ipynb} / \texttt{evaluate\_bpd.py}: AdamW
+        ($\beta=(0.9,0.95)$, wd $10^{-4}$), cosine LR with one warmup epoch,
+        inputs scaled to $[-1,1]$, gaussian-noise runs in bf16 autocast,
+        uniform-dequantization (likelihood) runs in fp32, and the official
+        bits/dim formula (Gaussian prior term with the $\log 128$ scaling
+        correction, generalized from 3 channels to $C$).
+  \item Data: datasets and deterministic splits come from step~1
+        (\texttt{step1\_datasets.build\_dataset}); an adapter rescales to
+        $[-1,1]$ and applies the official random horizontal flip where
+        configured.
+  \item Config: \texttt{configs/step2\_tarflow.yml}. Outputs:
+        \texttt{outputs/step2\_tarflow/\{data,figures\}/}. Commands executed:
+        \texttt{python step2\_tarflow.py --runs mnist\_toy} (GPU 0) and
+        \texttt{python step2\_tarflow.py --runs cifar10\_uniform} (GPU 1),
+        then \texttt{python step2\_tarflow.py --collect}.
+  \item Run \textbf{mnist\_toy}: exact replication of Apple's released MNIST
+        toy experiment (\texttt{train\_local.ipynb} defaults):
+        class-conditional TarFlow $[4\hbox{-}128\hbox{-}4\hbox{-}4]$
+        (patch-channels-blocks-layers), gaussian noise $\sigma=0.1$, batch
+        256, lr $2\times10^{-3}$, 100 epochs. Deliverables: conditional
+        sample grid (one row per digit) and the notebook's Bayes-rule
+        classifier evaluation $\arg\min_y \frac12\mathbb{E}[z_y^2] -
+        \log|\det|_y$ on the step-1 test split.
+  \item Run \textbf{cifar10\_uniform}: unconditional CIFAR-10 likelihood run
+        in the paper's likelihood configuration style: uniform
+        dequantization, fp32, patch size 2 (as in their ImageNet~64
+        2.99-bpd config), TarFlow $[2\hbox{-}256\hbox{-}8\hbox{-}4]$
+        ($\sim$26M params), batch 128, lr $2\times10^{-4}$, 60 epochs on one
+        RTX~4090. Validation bpd is tracked every 5 epochs; final test bpd
+        uses the official formula on the step-1 test split.
+  \item Scale caveat (stated up front): the paper's quantitative likelihood
+        benchmark is \emph{unconditional ImageNet 64$\times$64}, where
+        TarFlow $[2\hbox{-}768\hbox{-}8\hbox{-}8]$ ($\sim$470M params, 8
+        $\times$ A100, 200 epochs) reaches \textbf{2.99 bpd}; the paper
+        reports no MNIST or CIFAR-10 numbers. ImageNet is not yet staged
+        (step~1), so this step validates the framework end-to-end at small
+        scale and positions results against the classic CIFAR-10 flow
+        literature (RealNVP 3.49, Glow 3.35, Flow++ 3.08 bpd).
+  \item Sampling uses the plain reverse pass from Gaussian noise; the
+        paper's score-based denoising step (Tweedie correction) is not
+        applied here.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step2_tarflow.yml}}
+
+\subsection{Results}
+\begin{center}
+\InputIfFileExists{../outputs/step2_tarflow/data/summary_table_step2.tex}{}
+  {\emph{outputs/step2\_tarflow not generated yet -- run
+   \texttt{python step2\_tarflow.py}.}}
+\end{center}
+Model column is [patch-channels-blocks-layers/block]. Full per-epoch metrics
+are in \texttt{outputs/step2\_tarflow/data/*\_metrics.csv}.
+
+\subsection{Results: figures}
+\InputIfFileExists{../outputs/step2_tarflow/data/figures_step2.tex}{}
+  {\emph{not generated yet.}}
+\clearpage
+
+\subsection{Analysis}
+\begin{itemize}
+  \item The mnist\_toy run reproduces Apple's released toy example: training
+        loss decreases smoothly from the first epochs ($-0.70$ at epoch~1 to
+        $\approx-1.62$ at epoch 100), the conditional sample grid shows clean,
+        clearly class-consistent digits (one row per class), and the
+        Bayes-rule classifier reaches \textbf{97.62\%} test accuracy --
+        confirming the trained TarFlow is a working class-conditional density
+        model, which is exactly the property the official notebook
+        demonstrates. Residual background grain in the samples is the
+        $\sigma=0.1$ training noise; the paper's denoising step (not applied
+        here) is designed to remove it.
+  \item The cifar10\_uniform run was \emph{interrupted at epoch 9/60}: GPU~1
+        of the host failed under sustained load (fell off the PCIe bus,
+        wedging the NVIDIA driver for new processes host-wide) and the run is
+        queued to restart after a host reboot; the trainer now checkpoints
+        optimizer state every epoch so future interruptions resume exactly. The
+        partial trajectory is healthy and archived (metrics CSV + curves):
+        train loss $-1.79 \to -3.18$ over 9 epochs and validation bpd
+        \textbf{4.041} at epoch~5, the only bpd evaluation before the
+        failure. For calibration: uniform-dequantization models start near
+        8~bpd at random init, classic CIFAR-10 flows reach RealNVP 3.49 /
+        Glow 3.35 / Flow++ 3.08 at convergence, and the paper's ImageNet-64
+        state of the art is 2.99 bpd at $\sim$18$\times$ more parameters and
+        $\sim$27$\times$ more GPU-epochs. Exact replication of the paper's
+        headline number additionally requires staging ImageNet 64$\times$64
+        (step-1 instructions).
+  \item Framework verdict: the official TarFlow code trains stably out of
+        the box under both noise regimes (bf16 gaussian, fp32 uniform), the
+        likelihood pipeline (uniform dequantization + official bpd formula)
+        produces sensible, steadily improving numbers, and inversion
+        (sampling) works. The one incident so far was hardware, not the
+        model.
+\end{itemize}
+
 \section{Reproducibility}
 \begin{itemize}
   \item Global seed \texttt{20260831} (config) seeds torch, numpy, and every
@@ -170,6 +283,14 @@ datasets).
 {\scriptsize
 \IfFileExists{../outputs/step1_datasets/data/provenance.json}
   {\verbatiminput{../outputs/step1_datasets/data/provenance.json}}
+  {\emph{provenance.json not generated yet.}}}
+
+\begin{itemize}
+  \item Provenance for step 2 (includes the pinned ml-tarflow commit):
+\end{itemize}
+{\scriptsize
+\IfFileExists{../outputs/step2_tarflow/data/provenance.json}
+  {\verbatiminput{../outputs/step2_tarflow/data/provenance.json}}
   {\emph{provenance.json not generated yet.}}}
 
 \end{document}

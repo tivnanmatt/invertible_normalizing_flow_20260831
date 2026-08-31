@@ -1,0 +1,75 @@
+# Config for step1_datasets.py -- datasets & dataloaders.
+#
+# data_root is the shared benchmark-dataset repository on the axis03 data
+# drive, mounted into the recon-dev container at the same path
+# (/data/image_benchmarks). Datasets download/live there once and are reused
+# across projects; nothing dataset-sized lands in the git repo.
+
+seed: 20260831
+data_root: /data/image_benchmarks
+output_root: outputs/step1_datasets
+
+loader:
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+
+split:
+  # carved from the official train pool when no official val split exists
+  val_fraction: 0.10
+  # only used for single-pool datasets with no official splits (ffhq, celeba_hq)
+  test_fraction: 0.10
+
+figures:
+  samples_per_split: 8     # images per row in the sample-grid figure
+  stats_max_batches: 20    # batches used for per-channel mean/std
+
+datasets:
+  # ---- small standard benchmarks (auto-download) ----
+  mnist:         {enabled: true}
+  fashion_mnist: {enabled: true}
+  cifar10:       {enabled: true}
+  cifar100:      {enabled: true}
+  svhn:          {enabled: true}
+
+  # ---- MedMNIST 2D collection (auto-download) ----
+  # All 12 2D members are supported; the run set below spans the modalities
+  # (pathology, blood smear, dermoscopy, X-ray, ultrasound, fundus, abdominal
+  # CT). octmnist/tissuemnist/chestmnist are large; enable by adding flags.
+  medmnist:
+    enabled: true
+    size: 28
+    flags:
+      - pathmnist
+      - bloodmnist
+      - dermamnist
+      - pneumoniamnist
+      - breastmnist
+      - retinamnist
+      - organamnist
+
+  # ---- faces / natural images ----
+  celeba:          # aligned CelebA; auto-download tried, gdrive quota permitting
+    enabled: true
+    image_size: 64
+  imagenette:      # fast.ai 10-class ImageNet subset; auto-download stand-in
+    enabled: true  # for full ImageNet in quick experiments
+    variant: 160px
+    image_size: 64
+  imagenet:        # full ILSVRC2012; manual download (access terms)
+    enabled: true
+    image_size: 64
+  afhq:            # animal faces (cat/dog/wild), StarGAN-v2 release
+    enabled: true
+    version: v1
+    image_size: 64
+    attempt_download: true
+  ffhq:            # 70k faces; manual download (NVlabs)
+    enabled: true
+    image_size: 128
+  celeba_hq:       # 30k faces; manual download
+    enabled: true
+    image_size: 256
+  lsun_bedroom:    # LSUN lmdb; manual download
+    enabled: true
+    image_size: 64

@@ -1,0 +1,175 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{verbatim}
+\usepackage[hidelinks]{hyperref}
+\graphicspath{{../}}
+
+% ---------------------------------------------------------------------------
+% EXECUTABLE RESEARCH PAPER -- methods/results log for the invertible
+% normalizing flow project. Every methods item names the exact file that was
+% run and every results item is \input directly from that step's outputs/
+% folder, so the document always matches what was actually executed.
+% Regenerate: run the step*.py scripts, then pdflatex this file (twice).
+% This is the full-documentation version; prose compression and removal of
+% file-level references happens later, closer to submission.
+% ---------------------------------------------------------------------------
+
+\title{Invertible Normalizing Flows for Generative Image Modeling:\\
+Executable Methods and Results Log}
+\author{Matt Tivnan\thanks{Repository:
+\texttt{github.com/tivnanmatt/invertible\_normalizing\_flow\_20260831}}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document is the executable methods-and-results log for the invertible
+normalizing flow project. Each numbered step of the pipeline is one
+\texttt{step*.py} script paired with one YAML config in \texttt{configs/} and
+one output folder under \texttt{outputs/}; the tables and figures below are
+included directly from those output folders, so the compiled PDF is an exact
+record of what was run and what it produced. Step~1 (this version) builds
+PyTorch datasets and dataloaders with deterministic train/val/test splits for
+the standard generative-image-modeling benchmarks: MNIST, FashionMNIST,
+CIFAR-10/100, SVHN, the MedMNIST 2D collection, CelebA, Imagenette, ImageNet,
+AFHQ, FFHQ, CelebA-HQ, and LSUN bedroom.
+\end{abstract}
+
+\section{Execution environment}
+\begin{itemize}
+  \item Host: \texttt{axis03}; container: \texttt{recon-dev}
+        (image \texttt{localhost:5000/recon:acr-20260819-v1};
+        PyTorch 2.11.0+cu128, torchvision 0.26.0, CUDA 12.4, 2 GPUs).
+  \item Repository mounted at \texttt{/dev\_ws/invertible\_normalizing\_flow\_20260831}
+        inside the container (shared workspace
+        \texttt{/home/staticct/recon-dev/workspace} on the host).
+  \item Datasets live on the axis03 data drive at
+        \texttt{/data/image\_benchmarks}, mounted into the container at the
+        same path. This is a shared local repository of public benchmarks,
+        reused across projects; nothing dataset-sized is stored in git.
+  \item All steps are run as
+        \texttt{docker exec recon-dev python /dev\_ws/invertible\_normalizing\_flow\_20260831/step<N>\_*.py}.
+  \item Exact package versions, the resolved config, and the command line for
+        the run shown in this PDF are recorded in
+        \texttt{outputs/step1\_datasets/data/provenance.json}.
+\end{itemize}
+
+\section{Step 1: Datasets and dataloaders}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step1\_datasets.py} (repository root). Config:
+        \texttt{configs/step1\_datasets.yml}. Outputs:
+        \texttt{outputs/step1\_datasets/\{data,figures\}/}.
+  \item Command executed for this document:
+        \texttt{python step1\_datasets.py}
+        (runs every dataset enabled in the config).
+  \item The script exposes a library API used by later steps:
+        \texttt{build\_dataset(name, cfg)} returns a bundle of three
+        \texttt{torch.utils.data.Dataset} splits plus metadata, and
+        \texttt{get\_dataloaders(bundle, cfg)} wraps them in
+        \texttt{DataLoader}s (batch size, workers, pinning from the config).
+  \item Auto-download datasets: MNIST, FashionMNIST, CIFAR-10, CIFAR-100,
+        SVHN (torchvision); the MedMNIST 2D collection (\texttt{medmnist}
+        package, official train/val/test); Imagenette (fast.ai 10-class
+        ImageNet subset, used as a fast stand-in for ImageNet); AFHQ
+        (StarGAN-v2 release, fetched from the official Dropbox link); CelebA
+        (torchvision Google-Drive download, quota permitting).
+  \item Manual-download datasets (access terms or hosting): ImageNet
+        (ILSVRC2012), FFHQ, CelebA-HQ, LSUN bedroom. When absent, the script
+        records them as \emph{unavailable} together with exact acquisition
+        instructions (Section~\ref{sec:unavailable}) instead of failing.
+  \item Train/val/test policy (deterministic, seeded from the config):
+        official splits are used whenever they exist (MedMNIST, CelebA);
+        datasets with only train/test get a validation set carved from train
+        (10\%); datasets whose public split is train/val only (Imagenette,
+        ImageNet, AFHQ) use the official val as \emph{test} and carve val
+        from train; single-pool datasets (FFHQ, CelebA-HQ) are split
+        80/10/10.
+  \item Transforms: \texttt{ToTensor} to $[0,1]$ floats only; variable-size
+        natural-image datasets additionally get
+        \texttt{Resize}+\texttt{CenterCrop} to the per-dataset
+        \texttt{image\_size} in the config. No normalization or dequantization
+        is baked in here -- for flow training those belong to the model step
+        so the data step stays lossless.
+  \item Per dataset the run itself is the test: all three splits are
+        instantiated, real batches are pulled through the dataloaders,
+        per-channel mean/std are computed over up to 20 train batches, and
+        three figures are written (sample grid per split, pixel-intensity
+        histogram, class distribution where integer labels exist).
+  \item Machine-readable outputs: one JSON per dataset,
+        \texttt{summary.json}, \texttt{summary.csv},
+        \texttt{provenance.json}, and the \LaTeX{} fragments
+        (\texttt{summary\_table.tex}, \texttt{figures\_step1.tex},
+        \texttt{unavailable\_step1.tex}) that are included verbatim below.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step1_datasets.yml}}
+
+\subsection{Results: dataset summary}
+\begin{center}
+\InputIfFileExists{../outputs/step1_datasets/data/summary_table.tex}{}
+  {\emph{outputs/step1\_datasets not generated yet -- run
+   \texttt{python step1\_datasets.py}.}}
+\end{center}
+Split sizes are reported after the split policy above; \emph{image} is the
+tensor shape $C\times H\times W$ delivered by the dataloaders; \emph{classes}
+is the number of integer classes (``--'' for unconditional / multi-label
+datasets).
+
+\subsection{Results: unavailable datasets}
+\label{sec:unavailable}
+\InputIfFileExists{../outputs/step1_datasets/data/unavailable_step1.tex}{}
+  {\emph{not generated yet.}}
+
+\subsection{Results: figures}
+\InputIfFileExists{../outputs/step1_datasets/data/figures_step1.tex}{}
+  {\emph{outputs/step1\_datasets not generated yet.}}
+\clearpage
+
+\subsection{Analysis}
+\begin{itemize}
+  \item Coverage: the available benchmarks span $28\times28$ grayscale
+        (MNIST, several MedMNIST members) through $64\times64$ RGB natural
+        images and faces (CIFAR, Imagenette, AFHQ, CelebA), which is the
+        standard ladder for likelihood-based generative models: density
+        results in bits/dim on MNIST/CIFAR-10, then perceptual-quality
+        results on faces/animals at higher resolution.
+  \item The pixel-intensity histograms show the strongly peaked, saturated
+        distributions typical of 8-bit images (large masses at 0 and 1,
+        e.g.\ MNIST background, CelebA skin tones). For normalizing flows
+        this directly motivates uniform dequantization and a logit
+        transform before the first coupling layer -- to be implemented and
+        ablated in the model step, not in the data step.
+  \item Class-distribution figures document which datasets are usable for
+        class-conditional modeling and how imbalanced they are; several
+        MedMNIST members are markedly imbalanced, which matters for
+        conditional likelihood evaluation.
+  \item Per-channel means/stds recorded in each dataset's JSON give the
+        constants for any input normalization later steps choose to apply.
+  \item Datasets marked unavailable (typically ImageNet, FFHQ, CelebA-HQ,
+        LSUN, and CelebA when the Google Drive quota blocks download) are
+        access-restricted or manually hosted; the pipeline documents the
+        exact acquisition path and picks them up automatically once placed
+        under \texttt{/data/image\_benchmarks}.
+\end{itemize}
+
+\section{Reproducibility}
+\begin{itemize}
+  \item Global seed \texttt{20260831} (config) seeds torch, numpy, and every
+        \texttt{random\_split}; splits are therefore identical across runs
+        and machines.
+  \item \texttt{outputs/} and dataset caches are gitignored; the committed
+        code + config + this PDF are the record, and any output can be
+        regenerated with the commands above.
+  \item Provenance for the run in this PDF:
+\end{itemize}
+{\scriptsize
+\IfFileExists{../outputs/step1_datasets/data/provenance.json}
+  {\verbatiminput{../outputs/step1_datasets/data/provenance.json}}
+  {\emph{provenance.json not generated yet.}}}
+
+\end{document}

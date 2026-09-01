@@ -1,0 +1,21 @@
+# Config for step3_invertible_modules.py -- invertible-library verification.
+
+seed: 20260901
+output_root: outputs/step3_invertible_modules
+tarflow_repo: /dev_ws/ml-tarflow   # for the MetaBlock permutation-slot test
+
+dims:
+  flat: 64          # D for flat (B,D) modules
+  image: [2, 8, 8]  # (C,H,W) for image modules (small so the autograd
+                    # Jacobian logdet check stays cheap: D = C*H*W = 128)
+  seq: 64           # T for sequence transforms (power of 2: Haar/Hadamard)
+
+batch: 64           # batch for reconstruction + timing
+timing_reps: 25     # median over this many timed calls
+viz_patch: 4        # patch size for the MNIST coefficient gallery (32/4 -> T=64)
+
+tolerances:
+  recon_fp32: 1.0e-4     # max |x - f^-1(f(x))| in fp32
+  logdet: 1.0e-3         # |logdet_module - slogdet(autograd jacobian)| (fp64)
+  orthogonality: 1.0e-5  # ||Q^T Q - I||_inf (fp64)
+  metablock: 1.0e-3      # TarFlow MetaBlock forward->reverse roundtrip (fp32)

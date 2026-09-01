@@ -270,6 +270,221 @@ are in \texttt{outputs/step2\_tarflow/data/*\_metrics.csv}.
         model.
 \end{itemize}
 
+\section{Step 3: Library of invertible modules with verification}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{invlib.py} (the library) and
+        \texttt{step3\_invertible\_modules.py} (the verification and
+        benchmark harness). Config:
+        \texttt{configs/step3\_invertible\_modules.yml}. Outputs:
+        \texttt{outputs/step3\_invertible\_modules/\{data,figures\}/}.
+  \item The library has two families with two contracts.
+        \textbf{SeqTransform} implements TarFlow's permutation-slot signature
+        \texttt{forward(x, dim, inverse)} and contains only ORTHOGONAL maps
+        ($|\det|=1$): identity, flip, random permutation, orthonormal Haar
+        wavelet, Walsh--Hadamard, DCT-II, discrete Hartley (real Fourier),
+        fixed random rotations, and two learnable orthogonal
+        parameterizations (products of Householder reflections; Cayley
+        transform of a skew matrix), plus composition. Orthogonality is the
+        exact condition under which the TarFlow metablock's likelihood
+        accounting (no logdet term for the reordering) and the invariance of
+        the $\mathcal{N}(0,I)$ prior are preserved, so these are drop-in
+        replacements: the causal transformer then autoregresses over
+        transform \emph{coefficients} -- arbitrary orthogonal features of the
+        patch sequence -- instead of the raw patch order.
+  \item \textbf{InvertibleModule} implements
+        \texttt{forward(x)$\to$(y, logdet)} / \texttt{inverse(y)} with exact
+        per-sample log-Jacobians: invertible diagonal (actnorm), Glow-style
+        PLU dense linear and invertible $1{\times}1$ convolution
+        (arXiv:1807.03039); invertible periodic (circular) convolutions
+        decoupled in the frequency domain in 2D and 1D -- the ``invertible
+        Fourier filter'' -- following Hoogeboom et al., arXiv:1901.11137;
+        monotone elementwise cubic $x + ax^3$ ($a\ge0$) with closed-form
+        Cardano inverse; general monotone odd polynomials (SOS-flow style,
+        arXiv:1905.02325) inverted by bisection+Newton; invertible leaky
+        ReLU; logit data transform; monotonic rational-quadratic splines
+        (arXiv:1906.04032); Woodbury low-rank-plus-diagonal linear maps
+        (Lu \& Huang, NeurIPS 2020); affine coupling (RealNVP-style); and
+        \textbf{SpectralFloorLinear}, the eigenvalue-floored low-rank map
+        proposed for this project: $A = U\,\mathrm{diag}(\lambda)U^\top +
+        \lambda_0(I-UU^\top)$ with orthonormal $U\in\mathbb{R}^{D\times k}$
+        and $\lambda_i = \lambda_0 + \mathrm{softplus}(\theta_i) \ge
+        \lambda_0 > 0$ -- a full-rank invertible stand-in for a rank-$k$
+        eigendecomposition in which every unretained eigenvalue is set to the
+        floor $\lambda_0$ (necessarily $\le$ each retained one) instead of
+        zero; the inverse and $\log\det = \sum_i\log\lambda_i +
+        (D-k)\log\lambda_0$ are analytic.
+  \item Verification per module (command: \texttt{python
+        step3\_invertible\_modules.py}): (1) reconstruction
+        $\max|x-f^{-1}(f(x))|$ in fp32 and fp64; (2) the module's logdet
+        against $\log|\det|$ of the full autograd Jacobian (fp64, one
+        sample); (3) $\|Q^\top Q - I\|_\infty$ for the orthogonal family;
+        (4) a TarFlow integration test: each SeqTransform is installed in an
+        actual \texttt{MetaBlock} (perturbed from identity) and the
+        sequential reverse pass must invert the forward pass; (5) cost:
+        median forward/inverse wall time and parameter count/bytes.
+  \item The harness caught two real implementation bugs before any training
+        used the library (a U/V swap in the Woodbury inverse, exposed by
+        identical fp32/fp64 reconstruction error; and a determinant-sign
+        over-restriction: the Hartley matrix has $\det=-1$, which is valid
+        for flows since only $\log|\det|$ enters the likelihood).
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step3_invertible_modules.yml}}
+
+\subsection{Results: verification}
+\begin{center}
+{\small
+\InputIfFileExists{../outputs/step3_invertible_modules/data/verification_table.tex}{}
+  {\emph{not generated yet -- run \texttt{python step3\_invertible\_modules.py}.}}}
+\end{center}
+
+\begin{center}
+\InputIfFileExists{../outputs/step3_invertible_modules/data/metablock_table.tex}{}
+  {\emph{not generated yet.}}
+\end{center}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.85\textwidth]{outputs/step3_invertible_modules/figures/timing.png}
+\caption{Median forward/inverse wall time per batch of 64 (CPU; the GPU rerun
+uses the same harness). File:
+\texttt{outputs/step3\_invertible\_modules/figures/timing.png}.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.8\textwidth]{outputs/step3_invertible_modules/figures/orthogonal_matrices.png}
+\caption{The orthogonal sequence transforms $Q$ ($64{\times}64$) available for
+the TarFlow permutation slot. File:
+\texttt{outputs/step3\_invertible\_modules/figures/orthogonal\_matrices.png}.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.9\textwidth]{outputs/step3_invertible_modules/figures/mnist_coefficients.png}
+\caption{An MNIST digit's patch sequence under each transform -- the
+``features'' the autoregressive model would model. Haar concentrates the digit
+into hierarchical detail coefficients; DCT/Hartley/Hadamard/random rotations
+spread it into global features. File:
+\texttt{outputs/step3\_invertible\_modules/figures/mnist\_coefficients.png}.}
+\end{figure}
+\clearpage
+
+\subsection{Analysis}
+\begin{itemize}
+  \item All 24 modules PASS: fp32 reconstruction errors are at roundoff
+        ($10^{-7}$--$10^{-6}$), every analytic logdet matches the autograd
+        Jacobian to $10^{-3}$ or (usually) far better in fp64, all orthogonal
+        maps satisfy $\|Q^\top Q-I\|_\infty<10^{-5}$, and every SeqTransform
+        passes the end-to-end MetaBlock forward$\to$reverse roundtrip at
+        $\sim10^{-6}$ -- i.e.\ the whole orthogonal family is verified
+        TarFlow-compatible before any training depends on it.
+  \item Cost: fixed orthogonal transforms are parameter-free and as cheap as
+        the baseline permutations at this scale (dense $64{\times}64$
+        matmul); learnable orthogonal maps (Householder, Cayley) cost more
+        per call because $Q$ is rebuilt each forward. Elementwise and
+        FFT-based modules sit in between; inverse cost exceeds forward cost
+        mainly for iterative inverses (monotone polynomial) and triangular
+        solves (PLU).
+\end{itemize}
+
+\section{Step 4: Ablation -- what should TarFlow autoregress over?}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step4\_tarflow\_ablation.py}; config:
+        \texttt{configs/step4\_tarflow\_ablation.yml}; outputs:
+        \texttt{outputs/step4\_tarflow\_ablation/\{data,figures\}/}.
+  \item Question: with everything else identical, which orthogonal feature
+        basis in the permutation slot gives the best generative performance
+        in a FIXED small number of epochs?
+  \item Protocol: unconditional MNIST zero-padded to $32{\times}32$ (padding
+        keeps 8-bit values valid for dequantization; $T=(32/4)^2=64$ is a
+        power of two so Haar/Hadamard apply), TarFlow
+        $[4\hbox{-}128\hbox{-}4\hbox{-}2]$, uniform dequantization in fp32,
+        identical seed (model init and data order) for every variant. Odd
+        blocks compose the transform with a flip so consecutive blocks
+        autoregress in opposite coefficient orders, mirroring the official
+        Identity/Flip alternation.
+  \item Variants (one SeqTransform per metablock): baseline\_flip (official),
+        identity\_only (control: no reordering), random\_perm, haar,
+        hadamard, dct, hartley, rand\_ortho (per-block seeds), householder
+        (learnable, 16 reflections), cayley (learnable).
+  \item Tracked per variant: val bits/dim per epoch, final test bits/dim,
+        wall time, transform parameter overhead, and (on GPU) peak memory;
+        plus a sample grid from the reverse pass.
+  \item Budget profiles: \texttt{full} (GPU: 12 epochs, all 54k train) and
+        \texttt{reduced} (CPU: 6 epochs, 12k subset). The run reported in
+        this version used the \texttt{reduced} CPU profile because the
+        host's GPUs were unavailable (GPU~1 hardware failure, reboot
+        pending); the identical command re-runs the \texttt{full} profile on
+        GPU afterwards.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step4_tarflow_ablation.yml}}
+
+\subsection{Results}
+\begin{center}
+\InputIfFileExists{../outputs/step4_tarflow_ablation/data/ranking_table.tex}{}
+  {\emph{not generated yet -- run \texttt{python step4\_tarflow\_ablation.py}.}}
+\end{center}
+
+\InputIfFileExists{../outputs/step4_tarflow_ablation/data/figures_step4.tex}{}
+  {\emph{not generated yet.}}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step4analysis}
+\begin{itemize}
+  \item The ranking table and overlay curve above are the study's primary
+        readout; the run is a controlled comparison (same init, data order,
+        budget), so ordering differences reflect the feature basis of the
+        autoregression, not noise in the setup. The finite-epoch caveat
+        applies by design: this measures which basis trains \emph{fastest},
+        not which wins asymptotically.
+  \item A first pass was run WITHOUT gradient clipping (archived in
+        \texttt{outputs/step4\_tarflow\_ablation/data\_noclip/}): ranking
+        cayley 2.507 $<$ baseline\_flip 2.625 $\ll$ identity\_only 4.524 $<$
+        random\_perm 4.773 $\ll$ hartley 6.23, dct 6.38, householder 6.56,
+        hadamard 6.57, rand\_ortho 7.32, and haar diverged to NaN. Two
+        mechanisms explain the pattern. (a)~Scale spread: orthogonal maps
+        preserve total energy but not per-coordinate scale -- the Haar/DCT DC
+        coefficient is $\sqrt{T}\approx 8$ times the (non-zero) mean image
+        value, so coefficient sequences have per-position scales far outside
+        the $[-1,1]$ patch range, which destabilizes early training at fixed
+        lr (hence the uniform \texttt{grad\_clip} added for the reported
+        run). (b)~Locality: dense global mixing destroys the 2D-adjacency
+        structure that makes next-patch prediction easy, so fixed dense bases
+        (and random permutations) start far behind within a small budget.
+  \item The standout: \textbf{cayley} -- a \emph{learnable} rotation
+        initialized near the identity ($Q\approx I$ at init) -- is the only
+        variant competitive with the official ordering, WINNING without
+        clipping (2.507 vs 2.625) and finishing a close second with it
+        (2.528 vs 2.474). Householder with $k=16$ random reflections starts
+        far from identity and behaves like the fixed dense mixes.
+        Within this budget, initialization at (near-)identity matters more
+        than the transform family; whether the learned rotation overtakes the
+        fixed ordering with a longer budget is exactly what the GPU
+        \texttt{full}-profile rerun will test.
+  \item With clipping, haar recovers from NaN to 4.390 -- essentially tied
+        with identity\_only (4.403) and ahead of random\_perm -- while the
+        global-support bases (hartley/dct/hadamard, 6.2--6.6) stay far
+        behind. Haar's locality (most coefficients have small support)
+        appears to make it the least-damaged fixed basis, supporting the
+        locality mechanism above.
+  \item Designated follow-ups once the host GPU returns: the \texttt{full}
+        profile rerun of this exact command; learnable orthogonal transforms
+        initialized AT Haar/DCT (test whether structure + learnability
+        beats identity init); per-coefficient actnorm between blocks
+        (inserted as a proper flow layer with its logdet, not in the
+        permutation slot) to remove the scale-spread confound; and the same
+        ablation on CIFAR-10.
+\end{itemize}
+
 \section{Reproducibility}
 \begin{itemize}
   \item Global seed \texttt{20260831} (config) seeds torch, numpy, and every
@@ -291,6 +506,17 @@ are in \texttt{outputs/step2\_tarflow/data/*\_metrics.csv}.
 {\scriptsize
 \IfFileExists{../outputs/step2_tarflow/data/provenance.json}
   {\verbatiminput{../outputs/step2_tarflow/data/provenance.json}}
+  {\emph{provenance.json not generated yet.}}}
+
+\begin{itemize}
+  \item Provenance for steps 3 and 4:
+\end{itemize}
+{\scriptsize
+\IfFileExists{../outputs/step3_invertible_modules/data/provenance.json}
+  {\verbatiminput{../outputs/step3_invertible_modules/data/provenance.json}}
+  {\emph{provenance.json not generated yet.}}
+\IfFileExists{../outputs/step4_tarflow_ablation/data/provenance.json}
+  {\verbatiminput{../outputs/step4_tarflow_ablation/data/provenance.json}}
   {\emph{provenance.json not generated yet.}}}
 
 \end{document}

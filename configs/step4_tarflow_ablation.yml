@@ -1,0 +1,57 @@
+# Config for step4_tarflow_ablation.py -- permutation-slot ablation.
+#
+# Every variant is trained with IDENTICAL model init, data order and budget;
+# only the per-block sequence transform differs (all orthogonal, so the
+# TarFlow likelihood accounting is untouched). Metric of merit: validation
+# bits/dim after the fixed budget ("generative performance in finite epochs").
+
+seed: 20260901
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step4_tarflow_ablation
+
+dataset: mnist
+img_size: 32        # zero-padded from 28 so T = (32/4)^2 = 64 is a power of 2
+channel_size: 1
+patch_size: 4
+noise_type: uniform # likelihood configuration (fp32, official bpd formula)
+grad_clip: 1.0      # uniform stabilizer for ALL variants: coefficient bases
+                    # (e.g. Haar, DC coeff ~ sqrt(T) x mean) have much larger
+                    # per-coordinate scales than raw patches and diverge
+                    # without it at this lr (first no-clip run: haar -> nan)
+
+model:              # small TarFlow so many variants fit in the budget
+  channels: 128
+  blocks: 4
+  layers_per_block: 2
+
+sample_nrow: 6      # 6x6 sample grid per variant
+
+budget:
+  full:             # GPU profile (auto-selected when CUDA is available)
+    epochs: 12
+    train_subset: 0       # 0 = all 54k
+    val_subset: 4000
+    test_subset: 10000
+    batch: 128
+    lr: 1.0e-3
+    sample: true
+  reduced:          # CPU profile (GPU down 2026-09-01; rerun full after reboot)
+    epochs: 6
+    train_subset: 12000
+    val_subset: 2000
+    test_subset: 4000
+    batch: 128
+    lr: 1.0e-3
+    sample: true
+
+variants:
+  - baseline_flip   # official TarFlow: Identity / Flip alternation
+  - identity_only   # control: no reordering at all
+  - random_perm     # fixed random patch permutation per block
+  - haar            # orthonormal Haar wavelet over the patch sequence
+  - hadamard        # Walsh-Hadamard
+  - dct             # DCT-II (frequency features)
+  - hartley         # discrete Hartley (real Fourier)
+  - rand_ortho      # fixed random rotation (different seed per block)
+  - householder     # learnable orthogonal (16 Householder reflections)
+  - cayley          # learnable orthogonal (Cayley transform)

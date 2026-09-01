@@ -13,10 +13,28 @@ is an exact record of what was run and what it produced.
 ```
 step1_datasets.py            datasets + dataloaders (also the step-1 test)
 step2_tarflow.py             TarFlow training/eval (official apple/ml-tarflow model)
+invlib.py                    library of invertible torch modules (2 families)
+step3_invertible_modules.py  verification + benchmarks for invlib (24 modules)
+step4_tarflow_ablation.py    permutation-slot ablation: what TarFlow autoregresses over
 configs/step<N>_*.yml        config per step
 outputs/step<N>_*/           data/ (json, csv, tex fragments) + figures/ (png)
 paper/main.tex               executable methods & results log -> main.pdf
 ```
+
+`invlib.py` families: **SeqTransform** — orthogonal maps with TarFlow's
+permutation-slot signature (identity/flip/permutations, Haar, Hadamard, DCT,
+Hartley, random + learnable Householder/Cayley rotations); orthogonality means
+zero logdet and an invariant N(0,I) prior, so they drop into TarFlow and the
+model autoregresses over transform coefficients. **InvertibleModule** —
+`forward(x)->(y, logdet)` / `inverse(y)`: actnorm, PLU linear, invertible 1x1
+conv (Glow), periodic/circular invertible convs in 1D+2D via FFT (Hoogeboom et
+al. 2019), monotone cubic (closed-form inverse) and odd polynomials
+(SOS-style), invertible leaky ReLU, logit, rational-quadratic splines,
+Woodbury low-rank+diagonal, affine coupling, and SpectralFloorLinear (ours:
+eigenvalue-floored low-rank map, all unretained eigenvalues set to the
+retained floor instead of zero). Step 3 verifies every module (inversion,
+autograd-checked logdet, orthogonality, MetaBlock roundtrip) and benchmarks
+forward/inverse cost.
 
 Step 2 imports the official TarFlow model (`transformer_flow.py`) unmodified
 from a clone of [apple/ml-tarflow](https://github.com/apple/ml-tarflow) at

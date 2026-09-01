@@ -1,0 +1,750 @@
+"""invlib.py -- Library of invertible torch modules for normalizing flows.
+
+Two module families with two contracts:
+
+1. SeqTransform: drop-in replacements for TarFlow's Permutation slot.
+     forward(x, dim=1, inverse=False) -> Tensor
+   All members are ORTHOGONAL (|det| = 1, logdet = 0), which is exactly the
+   condition under which the TarFlow metablock's likelihood accounting stays
+   valid and the N(0,I) prior stays invariant. The autoregression then runs
+   over transform coefficients (Haar, DCT, ...) instead of raw patch order.
+
+2. InvertibleModule: general invertible maps with explicit Jacobian.
+     forward(x) -> (y, logdet)   logdet: per-sample (B,), natural log
+     inverse(y) -> x
+   Members include invertible convolutions, elementwise monotone
+   nonlinearities, invertible linear parameterizations, and coupling.
+
+References:
+  Glow invertible 1x1 conv / PLU: Kingma & Dhariwal, arXiv:1807.03039
+  Periodic (Fourier) + emerging invertible dxd convs: Hoogeboom, van den Berg,
+      Welling, ICML 2019, arXiv:1901.11137
+  Invertible Convolutional Flow: Karami et al., NeurIPS 2019
+  Neural Spline Flows (rational-quadratic): Durkan et al., arXiv:1906.04032
+  Sum-of-Squares Polynomial Flow: Jaini et al., arXiv:1905.02325
+  Woodbury transformations: Lu & Huang, NeurIPS 2020
+  Householder/Cayley orthogonal parameterizations: see JMLR 22(57) flows review
+  SpectralFloorLinear: eigenvalue-floored low-rank map (M. Tivnan, this work)
+"""
+
+import math
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+# ==========================================================================
+# Orthogonal matrix builders (float64, cast on use)
+# ==========================================================================
+
+
+def haar_matrix(n: int) -> torch.Tensor:
+    """Orthonormal Haar transform matrix, n must be a power of 2."""
+    assert n & (n - 1) == 0 and n > 0, f"Haar needs power-of-2 size, got {n}"
+    h = torch.ones(1, 1, dtype=torch.float64)
+    while h.shape[0] < n:
+        top = torch.kron(h, torch.tensor([[1.0, 1.0]], dtype=torch.float64))
+        bot = torch.kron(torch.eye(h.shape[0], dtype=torch.float64),
+                         torch.tensor([[1.0, -1.0]], dtype=torch.float64))
+        h = torch.cat([top, bot], dim=0) / math.sqrt(2.0)
+    return h
+
+
+def hadamard_matrix(n: int) -> torch.Tensor:
+    """Orthonormal Walsh-Hadamard matrix, n must be a power of 2."""
+    assert n & (n - 1) == 0 and n > 0, f"Hadamard needs power-of-2 size, got {n}"
+    h = torch.ones(1, 1, dtype=torch.float64)
+    while h.shape[0] < n:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0) / math.sqrt(2.0)
+    return h
+
+
+def dct_matrix(n: int) -> torch.Tensor:
+    """Orthonormal DCT-II matrix (any n)."""
+    k = torch.arange(n, dtype=torch.float64).unsqueeze(1)
+    m = torch.arange(n, dtype=torch.float64).unsqueeze(0)
+    c = torch.cos(math.pi * k * (2 * m + 1) / (2 * n)) * math.sqrt(2.0 / n)
+    c[0] /= math.sqrt(2.0)
+    return c
+
+
+def hartley_matrix(n: int) -> torch.Tensor:
+    """Orthonormal discrete Hartley transform (real 'Fourier'; involution)."""
+    k = torch.arange(n, dtype=torch.float64).unsqueeze(1)
+    m = torch.arange(n, dtype=torch.float64).unsqueeze(0)
+    a = 2 * math.pi * k * m / n
+    return (torch.cos(a) + torch.sin(a)) / math.sqrt(n)
+
+
+def random_orthogonal_matrix(n: int, seed: int = 0) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    a = torch.randn(n, n, generator=g, dtype=torch.float64)
+    q, r = torch.linalg.qr(a)
+    return q * torch.sign(torch.diagonal(r)).unsqueeze(0)  # deterministic sign
+
+
+# ==========================================================================
+# Family 1: SeqTransform -- TarFlow permutation-slot compatible (orthogonal)
+# ==========================================================================
+
+
+class SeqTransform(nn.Module):
+    """Orthogonal transform along one tensor dimension.
+
+    TarFlow-compatible signature: forward(x, dim=1, inverse=False) -> Tensor.
+    Convention: y = Q x along `dim` (coefficients are rows of Q).
+    """
+
+    def __init__(self, seq_length: int):
+        super().__init__()
+        self.seq_length = seq_length
+
+    def matrix(self) -> torch.Tensor:
+        """The (T,T) orthogonal matrix (float32). Override or set buffer Q."""
+        return self.Q
+
+    def forward(self, x, dim: int = 1, inverse: bool = False):
+        q = self.matrix().to(dtype=x.dtype, device=x.device)
+        xm = x.movedim(dim, -1)
+        ym = xm @ (q if inverse else q.t())
+        return ym.movedim(-1, dim)
+
+
+class SeqIdentity(SeqTransform):
+    def forward(self, x, dim: int = 1, inverse: bool = False):
+        return x
+
+    def matrix(self):
+        return torch.eye(self.seq_length)
+
+
+class SeqFlip(SeqTransform):
+    def forward(self, x, dim: int = 1, inverse: bool = False):
+        return x.flip(dims=[dim])
+
+    def matrix(self):
+        return torch.eye(self.seq_length).flip(0)
+
+
+class SeqRandomPermutation(SeqTransform):
+    def __init__(self, seq_length: int, seed: int = 0):
+        super().__init__(seq_length)
+        g = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(seq_length, generator=g)
+        self.register_buffer("perm", perm)
+        self.register_buffer("inv_perm", torch.argsort(perm))
+
+    def forward(self, x, dim: int = 1, inverse: bool = False):
+        idx = self.inv_perm if inverse else self.perm
+        return x.index_select(dim, idx.to(x.device))
+
+    def matrix(self):
+        return torch.eye(self.seq_length)[self.perm]
+
+
+class _FixedMatrixSeq(SeqTransform):
+    def __init__(self, seq_length: int, q64: torch.Tensor):
+        super().__init__(seq_length)
+        self.register_buffer("Q", q64.to(torch.float32))
+
+
+class SeqHaar(_FixedMatrixSeq):
+    def __init__(self, seq_length: int):
+        super().__init__(seq_length, haar_matrix(seq_length))
+
+
+class SeqHadamard(_FixedMatrixSeq):
+    def __init__(self, seq_length: int):
+        super().__init__(seq_length, hadamard_matrix(seq_length))
+
+
+class SeqDCT(_FixedMatrixSeq):
+    def __init__(self, seq_length: int):
+        super().__init__(seq_length, dct_matrix(seq_length))
+
+
+class SeqHartley(_FixedMatrixSeq):
+    def __init__(self, seq_length: int):
+        super().__init__(seq_length, hartley_matrix(seq_length))
+
+
+class SeqRandomOrthogonal(_FixedMatrixSeq):
+    def __init__(self, seq_length: int, seed: int = 0):
+        super().__init__(seq_length, random_orthogonal_matrix(seq_length, seed))
+
+
+class SeqHouseholder(SeqTransform):
+    """Learnable orthogonal map: product of k Householder reflections."""
+
+    def __init__(self, seq_length: int, k: int = 8, seed: int = 0):
+        super().__init__(seq_length)
+        g = torch.Generator().manual_seed(seed)
+        self.v = nn.Parameter(torch.randn(k, seq_length, generator=g))
+
+    def matrix(self):
+        q = torch.eye(self.seq_length, device=self.v.device, dtype=self.v.dtype)
+        for i in range(self.v.shape[0]):
+            v = self.v[i] / self.v[i].norm().clamp_min(1e-8)
+            q = q - 2.0 * torch.outer(v, v @ q)
+        return q
+
+
+class SeqCayley(SeqTransform):
+    """Learnable orthogonal map via the Cayley transform of a skew matrix."""
+
+    def __init__(self, seq_length: int, seed: int = 0, init_scale: float = 0.1):
+        super().__init__(seq_length)
+        g = torch.Generator().manual_seed(seed)
+        self.w = nn.Parameter(init_scale * torch.randn(seq_length, seq_length, generator=g)
+                              / math.sqrt(seq_length))
+
+    def matrix(self):
+        a = self.w - self.w.t()
+        eye = torch.eye(self.seq_length, device=a.device, dtype=a.dtype)
+        return torch.linalg.solve(eye + a, eye - a)
+
+
+class SeqCompose(SeqTransform):
+    """Compose transforms t1 then t2 then ... (forward order)."""
+
+    def __init__(self, transforms):
+        super().__init__(transforms[0].seq_length)
+        self.transforms = nn.ModuleList(transforms)
+
+    def forward(self, x, dim: int = 1, inverse: bool = False):
+        ts = reversed(self.transforms) if inverse else self.transforms
+        for t in ts:
+            x = t(x, dim=dim, inverse=inverse)
+        return x
+
+    def matrix(self):
+        q = torch.eye(self.seq_length)
+        for t in self.transforms:
+            q = t.matrix().to(q.dtype) @ q
+        return q
+
+
+SEQ_REGISTRY = {
+    "identity": SeqIdentity,
+    "flip": SeqFlip,
+    "random_perm": SeqRandomPermutation,
+    "haar": SeqHaar,
+    "hadamard": SeqHadamard,
+    "dct": SeqDCT,
+    "hartley": SeqHartley,
+    "rand_ortho": SeqRandomOrthogonal,
+    "householder": SeqHouseholder,
+    "cayley": SeqCayley,
+}
+
+
+# ==========================================================================
+# Family 2: InvertibleModule -- general invertible maps with logdet
+# ==========================================================================
+
+
+class InvertibleModule(nn.Module):
+    """Contract: forward(x) -> (y, logdet[B]); inverse(y) -> x."""
+
+    def forward(self, x):
+        raise NotImplementedError
+
+    def inverse(self, y):
+        raise NotImplementedError
+
+
+def _per_sample(t, batch):
+    """Broadcast a scalar logdet to per-sample shape (B,)."""
+    if t.dim() == 0:
+        return t.expand(batch)
+    return t
+
+
+class InvertibleDiagonal(InvertibleModule):
+    """y = s * x + b elementwise over feature dims (ActNorm without data init)."""
+
+    def __init__(self, shape):
+        super().__init__()
+        self.log_s = nn.Parameter(0.05 * torch.randn(shape))
+        self.b = nn.Parameter(torch.zeros(shape))
+
+    def forward(self, x):
+        y = x * self.log_s.exp() + self.b
+        return y, _per_sample(self.log_s.sum(), x.shape[0])
+
+    def inverse(self, y):
+        return (y - self.b) * (-self.log_s).exp()
+
+
+class ActNorm2d(InvertibleModule):
+    """Per-channel affine for images (B,C,H,W); Glow-style actnorm."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.log_s = nn.Parameter(0.05 * torch.randn(channels))
+        self.b = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x):
+        s = self.log_s.view(1, -1, 1, 1)
+        y = x * s.exp() + self.b.view(1, -1, 1, 1)
+        ld = self.log_s.sum() * x.shape[2] * x.shape[3]
+        return y, _per_sample(ld, x.shape[0])
+
+    def inverse(self, y):
+        s = self.log_s.view(1, -1, 1, 1)
+        return (y - self.b.view(1, -1, 1, 1)) * (-s).exp()
+
+
+class PLULinear(InvertibleModule):
+    """Dense invertible linear via PLU parameterization (Glow-style).
+    y = P L U x with L unit-lower, U upper with parameterized nonzero diag."""
+
+    def __init__(self, dim, seed: int = 0):
+        super().__init__()
+        self.dim = dim
+        w = random_orthogonal_matrix(dim, seed).to(torch.float32)
+        p, l, u = torch.linalg.lu(w)
+        self.register_buffer("P", p)
+        self.l_raw = nn.Parameter(l)
+        s = torch.diagonal(u)
+        self.register_buffer("sign_s", torch.sign(s))
+        self.log_s = nn.Parameter(s.abs().log())
+        self.u_raw = nn.Parameter(torch.triu(u, 1))
+        self.register_buffer("l_mask", torch.tril(torch.ones(dim, dim), -1))
+        self.register_buffer("eye", torch.eye(dim))
+
+    def _lu(self):
+        l = self.l_raw * self.l_mask + self.eye
+        u = torch.triu(self.u_raw, 1) + torch.diag(self.sign_s * self.log_s.exp())
+        return l, u
+
+    def forward(self, x):
+        l, u = self._lu()
+        y = x @ (self.P @ l @ u).t()
+        return y, _per_sample(self.log_s.sum(), x.shape[0])
+
+    def inverse(self, y):
+        l, u = self._lu()
+        z = y @ torch.linalg.inv(self.P).t()
+        z = torch.linalg.solve_triangular(l, z.t(), upper=False).t()
+        return torch.linalg.solve_triangular(u, z.t(), upper=True).t()
+
+
+class Invertible1x1Conv2d(InvertibleModule):
+    """Glow's invertible 1x1 convolution over channels of (B,C,H,W)."""
+
+    def __init__(self, channels, seed: int = 0):
+        super().__init__()
+        self.lin = PLULinear(channels, seed)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        y, ld = self.lin(x.permute(0, 2, 3, 1).reshape(-1, C))
+        y = y.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        return y, _per_sample(self.lin.log_s.sum() * H * W, B)
+
+    def inverse(self, y):
+        B, C, H, W = y.shape
+        x = self.lin.inverse(y.permute(0, 2, 3, 1).reshape(-1, C))
+        return x.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
+
+class CircularConv2d(InvertibleModule):
+    """Invertible periodic (circular) depthwise convolution, decoupled in the
+    frequency domain (Hoogeboom et al. 2019, 'periodic convolutions').
+    Per channel: y = ifft2(fft2(x) * H), H = fft2(kernel); invertible iff
+    all |H| > 0. logdet = sum log|H|. Initialized near identity."""
+
+    def __init__(self, channels, kernel_size=3, img_size=16, init_noise=0.01, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        k = init_noise * torch.randn(channels, kernel_size, kernel_size, generator=g)
+        k[:, 0, 0] += 1.0  # delta at origin -> identity map
+        self.kernel = nn.Parameter(k)
+        self.img_size = img_size
+
+    def _H(self, H, W, device, dtype):
+        pad = torch.zeros(self.kernel.shape[0], H, W, device=device, dtype=dtype)
+        kh, kw = self.kernel.shape[1:]
+        pad[:, :kh, :kw] = self.kernel.to(dtype)
+        return torch.fft.fft2(pad)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        Hf = self._H(H, W, x.device, x.dtype)
+        y = torch.fft.ifft2(torch.fft.fft2(x) * Hf.unsqueeze(0)).real
+        ld = Hf.abs().clamp_min(1e-12).log().sum()
+        return y, _per_sample(ld, B)
+
+    def inverse(self, y):
+        B, C, H, W = y.shape
+        Hf = self._H(H, W, y.device, y.dtype)
+        return torch.fft.ifft2(torch.fft.fft2(y) / Hf.unsqueeze(0)).real
+
+
+class CircularConv1d(InvertibleModule):
+    """Invertible circular convolution along the last dim of (B, T):
+    the 'invertible Fourier filter'. Same construction as CircularConv2d."""
+
+    def __init__(self, length, kernel_size=5, init_noise=0.01, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        k = init_noise * torch.randn(kernel_size, generator=g)
+        k[0] += 1.0
+        self.kernel = nn.Parameter(k)
+        self.length = length
+
+    def _H(self, T, device):
+        pad = torch.zeros(T, device=device)
+        pad[: self.kernel.shape[0]] = self.kernel
+        return torch.fft.fft(pad)
+
+    def forward(self, x):
+        Hf = self._H(x.shape[-1], x.device)
+        y = torch.fft.ifft(torch.fft.fft(x) * Hf).real
+        ld = Hf.abs().clamp_min(1e-12).log().sum()
+        return y, _per_sample(ld, x.shape[0])
+
+    def inverse(self, y):
+        Hf = self._H(y.shape[-1], y.device)
+        return torch.fft.ifft(torch.fft.fft(y) / Hf).real
+
+
+class MonotonicCubic(InvertibleModule):
+    """Elementwise y = x + a x^3 with a >= 0 (strictly increasing).
+    Closed-form inverse via Cardano (single real root since disc > 0).
+    logdet = sum log(1 + 3 a x^2)."""
+
+    def __init__(self, init_a=0.1):
+        super().__init__()
+        self.raw_a = nn.Parameter(torch.tensor(float(np.log(np.expm1(init_a)))))
+
+    @property
+    def a(self):
+        return F.softplus(self.raw_a)
+
+    def forward(self, x):
+        a = self.a
+        y = x + a * x**3
+        ld = (1 + 3 * a * x**2).log().flatten(1).sum(-1)
+        return y, ld
+
+    def inverse(self, y):
+        a = self.a.double()
+        yd = y.double()
+        p = 1.0 / a
+        q = -yd / a
+        disc = (q / 2) ** 2 + (p / 3) ** 3  # > 0 always
+        r = disc.sqrt()
+        x = torch.sign(-q / 2 + r) * (-q / 2 + r).abs().pow(1 / 3) \
+            + torch.sign(-q / 2 - r) * (-q / 2 - r).abs().pow(1 / 3)
+        return x.to(y.dtype)
+
+
+class MonotonicPolynomial(InvertibleModule):
+    """Elementwise odd polynomial y = c x + sum_j a_j x^(2j+3), c>0, a_j>=0
+    (derivative strictly positive -> invertible; SOS-flow-style).
+    Inverse via bisection + Newton refinement. logdet = sum log f'(x)."""
+
+    def __init__(self, degrees=(3, 5), init=0.05):
+        super().__init__()
+        self.degrees = tuple(degrees)
+        self.raw_c = nn.Parameter(torch.tensor(float(np.log(np.expm1(1.0)))))
+        self.raw_a = nn.Parameter(torch.full((len(self.degrees),),
+                                             float(np.log(np.expm1(init)))))
+
+    def _coefs(self):
+        return F.softplus(self.raw_c), F.softplus(self.raw_a)
+
+    def _f(self, x):
+        c, a = self._coefs()
+        y = c * x
+        for j, d in enumerate(self.degrees):
+            y = y + a[j] * x**d
+        return y
+
+    def _fp(self, x):
+        c, a = self._coefs()
+        d1 = torch.ones_like(x) * c
+        for j, d in enumerate(self.degrees):
+            d1 = d1 + a[j] * d * x ** (d - 1)
+        return d1
+
+    def forward(self, x):
+        return self._f(x), self._fp(x).log().flatten(1).sum(-1)
+
+    @torch.no_grad()
+    def inverse(self, y, iters=60):
+        lo = torch.full_like(y, -1.0)
+        hi = torch.ones_like(y)
+        while (self._f(lo) > y).any():
+            lo = torch.where(self._f(lo) > y, lo * 2, lo)
+        while (self._f(hi) < y).any():
+            hi = torch.where(self._f(hi) < y, hi * 2, hi)
+        for _ in range(iters):  # bisection (robust)
+            mid = 0.5 * (lo + hi)
+            below = self._f(mid) < y
+            lo = torch.where(below, mid, lo)
+            hi = torch.where(below, hi, mid)
+        x = 0.5 * (lo + hi)
+        for _ in range(3):  # Newton polish
+            x = x - (self._f(x) - y) / self._fp(x).clamp_min(1e-12)
+        return x
+
+
+class InvertibleLeakyReLU(InvertibleModule):
+    def __init__(self, slope=0.5):
+        super().__init__()
+        self.slope = slope
+
+    def forward(self, x):
+        y = torch.where(x >= 0, x, self.slope * x)
+        ld = (x < 0).flatten(1).sum(-1) * math.log(self.slope)
+        return y, ld.to(x.dtype)
+
+    def inverse(self, y):
+        return torch.where(y >= 0, y, y / self.slope)
+
+
+class Logit(InvertibleModule):
+    """Data-space transform (0,1) -> R: y = logit(alpha + (1-2 alpha) x)."""
+
+    def __init__(self, alpha=0.05):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        s = self.alpha + (1 - 2 * self.alpha) * x
+        y = s.log() - (1 - s).log()
+        ld = (math.log(1 - 2 * self.alpha) - s.log() - (1 - s).log()).flatten(1).sum(-1)
+        return y, ld
+
+    def inverse(self, y):
+        s = torch.sigmoid(y)
+        return (s - self.alpha) / (1 - 2 * self.alpha)
+
+
+class RationalQuadraticSpline(InvertibleModule):
+    """Elementwise monotonic rational-quadratic spline (Durkan et al. 2019),
+    K bins on [-B, B], identity tails; unconditional learnable knots shared
+    across all elements. Analytic inverse (quadratic root)."""
+
+    def __init__(self, num_bins=8, bound=4.0, min_size=1e-3):
+        super().__init__()
+        self.K, self.B, self.eps = num_bins, bound, min_size
+        self.w_raw = nn.Parameter(torch.zeros(num_bins))
+        self.h_raw = nn.Parameter(torch.zeros(num_bins))
+        self.d_raw = nn.Parameter(torch.zeros(num_bins - 1))
+
+    def _knots(self):
+        w = F.softmax(self.w_raw, -1) * (1 - self.K * self.eps) + self.eps
+        h = F.softmax(self.h_raw, -1) * (1 - self.K * self.eps) + self.eps
+        xk = F.pad(torch.cumsum(w, -1), (1, 0)) * 2 * self.B - self.B
+        yk = F.pad(torch.cumsum(h, -1), (1, 0)) * 2 * self.B - self.B
+        d = F.pad(F.softplus(self.d_raw) + self.eps, (1, 1), value=1.0)
+        return xk, yk, d
+
+    def _search(self, v, knots):
+        return (torch.searchsorted(knots[1:-1].contiguous(), v.contiguous().detach())
+                ).clamp(0, self.K - 1)
+
+    def forward(self, x):
+        xk, yk, d = self._knots()
+        inside = (x > -self.B) & (x < self.B)
+        xc = x.clamp(-self.B + 1e-6, self.B - 1e-6)
+        i = self._search(xc, xk)
+        x0, x1 = xk[i], xk[i + 1]
+        y0, y1 = yk[i], yk[i + 1]
+        d0, d1 = d[i], d[i + 1]
+        w = x1 - x0
+        s = (y1 - y0) / w
+        t = (xc - x0) / w
+        num = (y1 - y0) * (s * t**2 + d0 * t * (1 - t))
+        den = s + (d1 + d0 - 2 * s) * t * (1 - t)
+        y = torch.where(inside, y0 + num / den, x)
+        dnum = s**2 * (d1 * t**2 + 2 * s * t * (1 - t) + d0 * (1 - t) ** 2)
+        deriv = torch.where(inside, dnum / den**2, torch.ones_like(x))
+        return y, deriv.clamp_min(1e-12).log().flatten(1).sum(-1)
+
+    def inverse(self, y):
+        xk, yk, d = self._knots()
+        inside = (y > -self.B) & (y < self.B)
+        yc = y.clamp(-self.B + 1e-6, self.B - 1e-6)
+        i = self._search(yc, yk)
+        x0, x1 = xk[i], xk[i + 1]
+        y0, y1 = yk[i], yk[i + 1]
+        d0, d1 = d[i], d[i + 1]
+        w = x1 - x0
+        s = (y1 - y0) / w
+        r = (yc - y0)
+        a = (y1 - y0) * (s - d0) + r * (d1 + d0 - 2 * s)
+        b = (y1 - y0) * d0 - r * (d1 + d0 - 2 * s)
+        c = -s * r
+        t = 2 * c / (-b - (b**2 - 4 * a * c).clamp_min(0).sqrt())
+        return torch.where(inside, x0 + t * w, y)
+
+
+class SpectralFloorLinear(InvertibleModule):
+    """Eigenvalue-floored low-rank symmetric PSD map (M. Tivnan, this work).
+
+    A = U diag(lam) U^T + lam0 (I - U U^T), U in R^{D x k} orthonormal,
+    lam_i = lam0 + softplus(theta_i) >= lam0 > 0.
+
+    A full-rank invertible stand-in for a rank-k eigendecomposition: instead of
+    truncating unretained eigenvalues to zero (singular), they are all set to
+    the floor lam0, which is <= every retained eigenvalue by construction.
+    Analytic inverse A^-1 = U diag(1/lam) U^T + (1/lam0)(I - U U^T);
+    logdet = sum log lam_i + (D - k) log lam0."""
+
+    def __init__(self, dim, rank, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.dim, self.rank = dim, rank
+        self.w = nn.Parameter(torch.randn(dim, rank, generator=g) / math.sqrt(dim))
+        self.raw_lam0 = nn.Parameter(torch.tensor(float(np.log(np.expm1(1.0)))))
+        self.theta = nn.Parameter(0.1 * torch.randn(rank, generator=g))
+
+    def _factors(self):
+        u, _ = torch.linalg.qr(self.w)  # orthonormal columns
+        lam0 = F.softplus(self.raw_lam0) + 1e-6
+        lam = lam0 + F.softplus(self.theta)
+        return u, lam0, lam
+
+    def forward(self, x):
+        u, lam0, lam = self._factors()
+        proj = x @ u  # (B,k)
+        y = (proj * lam) @ u.t() + lam0 * (x - proj @ u.t())
+        ld = lam.log().sum() + (self.dim - self.rank) * lam0.log()
+        return y, _per_sample(ld, x.shape[0])
+
+    def inverse(self, y):
+        u, lam0, lam = self._factors()
+        proj = y @ u
+        return (proj / lam) @ u.t() + (y - proj @ u.t()) / lam0
+
+
+class WoodburyLinear(InvertibleModule):
+    """y = (diag(d) + U V^T) x with d > 0; inverse via the Woodbury identity,
+    logdet via the matrix determinant lemma (Lu & Huang, NeurIPS 2020)."""
+
+    def __init__(self, dim, rank, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.raw_d = nn.Parameter(torch.zeros(dim))
+        self.u = nn.Parameter(0.1 * torch.randn(dim, rank, generator=g) / math.sqrt(dim))
+        self.v = nn.Parameter(0.1 * torch.randn(dim, rank, generator=g) / math.sqrt(dim))
+
+    def _parts(self):
+        d = F.softplus(self.raw_d) + 1e-4
+        k = self.u.shape[1]
+        cap = torch.eye(k, device=d.device) + self.v.t() @ (self.u / d.unsqueeze(1))
+        return d, cap
+
+    def forward(self, x):
+        d, cap = self._parts()
+        y = x * d + (x @ self.v) @ self.u.t()  # row form of (D + U V^T) x
+        sign, logabs = torch.linalg.slogdet(cap)
+        ld = d.log().sum() + logabs  # sign must be +1 (checked in verification)
+        return y, _per_sample(ld, x.shape[0])
+
+    def inverse(self, y):
+        d, cap = self._parts()
+        z = y / d
+        w = torch.linalg.solve(cap, (z @ self.v).t()).t()  # cap^-1 V^T D^-1 y
+        return z - (w @ self.u.t()) / d
+
+
+class AffineCoupling(InvertibleModule):
+    """Classic affine coupling on flat features (RealNVP-style)."""
+
+    def __init__(self, dim, hidden=64, seed: int = 0):
+        super().__init__()
+        torch.manual_seed(seed)
+        self.d1 = dim // 2
+        self.net = nn.Sequential(
+            nn.Linear(self.d1, hidden), nn.GELU(),
+            nn.Linear(hidden, 2 * (dim - self.d1)),
+        )
+        self.net[-1].weight.data.zero_()
+        self.net[-1].bias.data.zero_()
+
+    def forward(self, x):
+        x1, x2 = x[:, : self.d1], x[:, self.d1:]
+        s, t = self.net(x1).chunk(2, -1)
+        s = 0.5 * torch.tanh(s)  # bounded scale for stability
+        y2 = x2 * s.exp() + t
+        return torch.cat([x1, y2], -1), s.sum(-1)
+
+    def inverse(self, y):
+        y1, y2 = y[:, : self.d1], y[:, self.d1:]
+        s, t = self.net(y1).chunk(2, -1)
+        s = 0.5 * torch.tanh(s)
+        return torch.cat([y1, (y2 - t) * (-s).exp()], -1)
+
+
+class SeqOrthogonalAsInvertible(InvertibleModule):
+    """Adapter: verify any SeqTransform under the InvertibleModule contract
+    (applied along the last dim of (B,T); logdet identically zero)."""
+
+    def __init__(self, seq_transform):
+        super().__init__()
+        self.t = seq_transform
+
+    def forward(self, x):
+        return self.t(x, dim=-1), torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+
+    def inverse(self, y):
+        return self.t(y, dim=-1, inverse=True)
+
+
+# ==========================================================================
+# Registry for the step-3 verification harness
+# ==========================================================================
+# Each entry: factory(dim_flat, img_shape, seq_len) -> (module, sample_input_fn)
+# kind: 'flat' (B,D) | 'image' (B,C,H,W) | 'seq' orthogonal along last dim
+
+
+def build_registry(D=64, img=(2, 8, 8), T=64, spline_bound=4.0):
+    C, H, W = img
+
+    def flat(b, scale=1.0):
+        return scale * torch.randn(b, D)
+
+    def img_in(b):
+        return torch.randn(b, C, H, W)
+
+    def unit(b):
+        return 0.05 + 0.9 * torch.rand(b, D)
+
+    reg = {}
+    # --- orthogonal sequence transforms (verified through the adapter) ---
+    for name, cls in SEQ_REGISTRY.items():
+        def make(cls=cls):
+            m = cls(T)
+            return SeqOrthogonalAsInvertible(m), (lambda b: torch.randn(b, T)), m
+        reg[f"seq_{name}"] = dict(make=make, kind="seq")
+    # --- linear invertible ---
+    reg["invertible_diagonal"] = dict(make=lambda: (InvertibleDiagonal(D), flat, None), kind="flat")
+    reg["actnorm2d"] = dict(make=lambda: (ActNorm2d(C), img_in, None), kind="image")
+    reg["plu_linear"] = dict(make=lambda: (PLULinear(D), flat, None), kind="flat")
+    reg["invertible_1x1_conv"] = dict(make=lambda: (Invertible1x1Conv2d(C), img_in, None), kind="image")
+    reg["circular_conv2d"] = dict(make=lambda: (CircularConv2d(C, 3, H), img_in, None), kind="image")
+    reg["circular_conv1d_fourier_filter"] = dict(
+        make=lambda: (CircularConv1d(D), flat, None), kind="flat")
+    reg["spectral_floor_linear"] = dict(
+        make=lambda: (SpectralFloorLinear(D, rank=8), flat, None), kind="flat")
+    reg["woodbury_linear"] = dict(make=lambda: (WoodburyLinear(D, rank=8), flat, None), kind="flat")
+    # --- elementwise nonlinear ---
+    reg["monotonic_cubic"] = dict(make=lambda: (MonotonicCubic(0.2), flat, None), kind="flat")
+    reg["monotonic_polynomial"] = dict(
+        make=lambda: (MonotonicPolynomial((3, 5), 0.1), flat, None), kind="flat")
+    reg["invertible_leaky_relu"] = dict(
+        make=lambda: (InvertibleLeakyReLU(0.5), flat, None), kind="flat")
+    reg["logit"] = dict(make=lambda: (Logit(0.05), unit, None), kind="flat")
+    reg["rq_spline"] = dict(
+        make=lambda: (RationalQuadraticSpline(8, spline_bound), lambda b: 2.0 * torch.randn(b, D), None),
+        kind="flat")
+    # --- coupling ---
+    reg["affine_coupling"] = dict(make=lambda: (AffineCoupling(D), flat, None), kind="flat")
+    return reg

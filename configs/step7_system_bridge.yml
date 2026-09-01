@@ -23,6 +23,29 @@ channel_size: 1
 patch_size: 4        # T = 64 tokens, same protocol as steps 4 and 6
 noise_type: uniform
 grad_clip: 1.0
+# Reject a batch whose loss exceeds  mult * running_ema + abs  (nats/dim).
+# The stiff base quadratic (1/min(diag Sigma_1) times a standard normal --
+# 25x at sigma=0.2) makes rare samples produce finite-but-astronomical losses
+# whose clipped gradients still destroy the weights; grad_clip alone does not
+# catch them. A run with n_skipped_steps = 0 is unaffected by this setting.
+loss_reject_mult: 5.0
+loss_reject_abs: 5.0
+# Soft-bound the coupling log-scale of every block: xa -> b*tanh(xa/b), applied
+# identically in the forward and the sampling direction so the map stays exactly
+# invertible. TarFlow's unbounded exp(-xa) chained across blocks: one block
+# extrapolating to xa = -11.5 fed the next a 1e5-scale token which answered with
+# xa = -9582 (inf in fp32). exp(8) = 3000x per block is far more than the fitted
+# scales ever need (|xa| < 4 on ordinary data) yet cannot overflow in 4 blocks.
+scale_bound: 8.0
+# Training target: `expected` scores f(x) against A^+A x and adds the closed-form
+# expectation of the measurement-noise term (exact, the base is Gaussian);
+# `sampled` redraws y every step. Same objective; `sampled` adds gradient noise
+# of the same size as the gradient itself. Evaluation always uses real (x, y).
+train_target: expected
+# Rewind-on-collapse: keep the last healthy epoch, restore it when an epoch
+# collapses (majority of batches rejected, or val bpd a full bit above best),
+# halve the peak lr, repeat the epoch. Reported per system; 0 disables.
+max_rewinds: 3
 
 model:               # identical to steps 4/6 so numbers stay comparable
   channels: 128
@@ -75,3 +98,35 @@ systems:
     kind: sr_4x
     sigma: 0.05
     beta: 1.0
+
+  # ABLATIONS. Each changes ONE factor against a control that collapsed, and
+  # keeps the control's sampled target and zero rewind budget so the test is
+  # clean: the question is whether Gaussian input noise (the TarFlow paper's
+  # generative recipe, in place of uniform dequantization) prevents the
+  # collapse on its own. Under the a(a-1) = v/tau^2 analysis it caps the gain
+  # the objective can demand at sqrt(v)/noise_std (4 for denoise, 1 for the
+  # sigma = 0.05 systems) versus sigma/tau ~ 25-90 with dequantization, and
+  # widens the valley in the coupling's shift from tau to noise_std. Its bpd is
+  # NOT a data likelihood (Gaussian input noise breaks the dequantization
+  # bound) and its samples carry noise_std of noise; compare survival, failure
+  # counts and PSNR.
+  denoise_gauss:                 # control: archived first attempt (unbounded
+    kind: denoise                # head, pixel basis), destroyed at epoch 50
+    sigma: 0.2
+    beta: 1.0
+    noise_type: gaussian
+    noise_std: 0.05
+    scale_bound: 0
+    train_target: sampled
+    max_rewinds: 0
+
+  inpaint_random_gauss:          # control: attempt 2 (bounded head, sampled
+    kind: inpaint_random         # target), collapsed at epoch 24
+    sigma: 0.05
+    drop: 0.5
+    seed: 0
+    beta: 1.0
+    noise_type: gaussian
+    noise_std: 0.05
+    train_target: sampled
+    max_rewinds: 0

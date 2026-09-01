@@ -872,21 +872,37 @@ coefficients}
         degenerates to a delta on the range space, and the flow likelihood is
         undefined. The constructor asserts it. Physically this is only the
         statement that every measurement carries noise.
-  \item \textbf{Why no conditioning network is needed.} $f$ is
-        \emph{unconditional}. At the optimum it must act on the range space
-        like the projector $A^{+}A$ --- then $f(x) - A^{+}y$ is exactly the
-        measurement noise $-A^{+}n$, whose law is precisely the range block of
-        $\Sigma_1$ --- while on the null space it must Gaussianise the
-        unmeasured content to $\mathcal{N}(0,\beta)$. The measurement enters
-        only through the base's mean and covariance. The conditioning that
-        inpainting demands (what belongs in the hole depends on the
-        surroundings) is supplied by TarFlow's own autoregression: later
-        tokens attend to earlier ones, so generated null-space content is
-        conditioned on observed range-space content. Nothing in the official
-        model is modified. A corollary worth noting: the identity map is
-        already a well-scaled initialisation, since with $f = \mathrm{id}$ the
-        range residual is exactly $-A^{+}n$ by construction, leaving the flow
-        only the null-space prior to learn.
+  \item \textbf{$f$ is unconditional --- what that buys and what it costs.}
+        The measurement enters only through the base's mean and covariance;
+        $f$ itself never sees $y$. With $f = \mathrm{id}$ the range residual
+        $x - A^{+}y$ is exactly $-A^{+}n$, whose law is the range block of
+        $\Sigma_1$ by construction, so training starts from a well-scaled
+        point and the flow's remaining job on the null space is to
+        Gaussianise the unmeasured content to $\mathcal{N}(0,\beta)$,
+        conditioned on the observed content through TarFlow's own
+        autoregression. The identity is \emph{not} the optimum on the range,
+        however, and an earlier draft of this section wrongly said it was.
+        Take one range coordinate with prior spread $\tau$ and base variance
+        $v = \sigma^2/s_i^2$, and let the flow act on it (for a fixed context)
+        as $z = m + a(x - m)$ about the base mean $m$. Maximising
+        $\mathbb{E}[\log\mathcal{N}(z; m, v)] + \log a$ gives
+        \[
+          a\,(a-1) = v/\tau^2 ,
+        \]
+        so the flow \emph{expands} prior-dominated coordinates ($a > 1$), and
+        that expansion is the only route by which the prior enters the
+        posterior. The resulting posterior sample has error variance $2v$ in
+        the low-noise regime $v \ll \tau^2$ (the Bayes value) and $3\tau^2$ in
+        the prior-dominated regime $v \gg \tau^2$ (Bayes: $2\tau^2$), whereas
+        the identity map would give $2v \gg \tau^2$ there. The unconditional
+        family is therefore exact where the measurement dominates and mildly
+        conservative where the prior dominates; it can only be made exact
+        everywhere by conditioning $f$ on $A^{+}y$, which is not done here.
+        A practical corollary: for \texttt{denoise} at $\sigma = 0.2$ the
+        MNIST background pixels have $\tau$ at the dequantisation scale
+        ($\approx 2\times10^{-3}$), so the objective \emph{demands} per-pixel
+        gains $a \approx \sqrt{v}/\tau$ of order $10^2$ --- the regime in
+        which an unbounded log-scale head extrapolates (next bullets).
   \item \textbf{Implementation via the SVD, with no matrix ever formed.}
         Writing $A = USV^\top$, every quantity is elementwise in the
         right-singular-vector coordinates $c = V^\top x$: the pseudo-inverse
@@ -896,6 +912,74 @@ coefficients}
         \emph{diagonal}. An operator is therefore fully specified by an
         orthogonal basis $V$ and a vector of singular values, which is what
         makes the exact Gaussian base density cheap to evaluate.
+  \item \textbf{The flow acts in the right-singular basis, not in pixels.}
+        TarFlow's coupling $z = (x - x_b)\,e^{-x_a}$ is elementwise within a
+        token and never mixes channels, so for a fixed context the map on one
+        patch is a per-pixel affine map. It can therefore only match a base
+        density that is diagonal in the coordinates it sees. $\Sigma_1$ is
+        diagonal in $V$, not in pixels: for $4\times4$ average pooling the 16
+        pixels of a patch are strongly correlated under $\Sigma_1$ (their
+        block mean is pinned to the measurement to $\pm 0.05$, their details
+        are white with variance $\beta = 1$). The flow is therefore applied
+        to $c = V^\top x$, an orthogonal change of variables with zero
+        log-determinant, and posterior samples are mapped back with $V$. For
+        the pixel-diagonal systems (\texttt{denoise}, both inpaintings) $V$
+        is a signed permutation and the model is unchanged; for the
+        super-resolution systems $V$ is the block Haar transform, i.e.\ the
+        step-6 patchifier, now dictated by the physics rather than chosen.
+  \item \textbf{Bounded log-scale.} The official coupling head is unbounded
+        and reads the un-normalised residual stream, so $x_a$ grows linearly
+        with a block's input magnitude and $e^{-x_a}$ chains across blocks.
+        \texttt{invlib.bound\_log\_scale} replaces $x_a$ by
+        $b\tanh(x_a/b)$ with $b = 8$ in \emph{both} directions (forward and
+        the KV-cached sampler), so the map is still exactly invertible; on
+        ordinary data $|x_a| < 4$, where the squash changes $x_a$ by at most
+        8\%, and one block can never amplify by more than $e^{8}$. Nothing
+        else in the official model is touched (the subclassing is applied at
+        run time, \texttt{ml-tarflow} is unmodified). The remaining
+        safeguards are the ones from step 4 --- gradient clipping and
+        rejection of a batch whose loss exceeds $5\times$ the running mean
+        plus 5 nats/dim.
+  \item \textbf{The training target is the expected one.} The natural
+        implementation redraws $y = Ax + \sigma\epsilon$ at every step and
+        scores $f(x)$ against $A^{+}y = A^{+}Ax + \sigma A^{+}\epsilon$. The
+        flow cannot predict $\epsilon$, so on each range coordinate the
+        gradient carries a noise term of magnitude $a\sigma/v$ that is
+        absent from the objective's expectation. Measured on the trained
+        \texttt{inpaint\_box} model of the second attempt (one batch of 64,
+        six draws of $\epsilon$), the noise part of the gradient had RMS norm
+        $19.4$ against $22.5$ for the expected gradient, and the individual
+        draws had cosine $0.50$--$0.87$ with it: roughly half of every
+        clipped step was noise, in a valley whose width in the coupling's
+        shift is $\tau \approx 2\times10^{-3}$ (the gain $a$ multiplies any
+        shift error, and $a\tau \approx \sigma$ at the optimum). Because the
+        base is Gaussian the expectation over $\epsilon$ is available in
+        closed form,
+        \[
+          \mathbb{E}_\epsilon \log\mathcal{N}(f(x); A^{+}y, \Sigma_1)
+          = \log\mathcal{N}(f(x); A^{+}Ax, \Sigma_1) - \frac{\mathrm{rank}\,A}{2\gamma},
+        \]
+        which is the same objective with the target noise integrated out
+        (verified numerically on all five systems: the mean of 400 sampled
+        draws matches the closed form to within $2.5$ standard errors).
+        Training uses it (\texttt{train\_target: expected}); evaluation
+        always scores real $(x, y)$ pairs, so every reported bpd is a
+        conditional likelihood. The ablations keep the sampled target.
+  \item \textbf{Rewind on collapse.} With the bound in place, the second
+        attempt's \texttt{inpaint\_random} run collapsed at epoch 24 (no
+        batch rejected before, 236 of 421 in that epoch) and \texttt{sr\_2x}
+        at epoch 52 (7 rejected before, then 285 of 421), in both cases with
+        a falling validation curve and no warning. The state at the end of
+        every healthy epoch (weights and optimizer) is kept; an epoch is
+        declared collapsed if a majority of its batches are rejected or the
+        robust validation mean is a full bit above its best, and is then
+        discarded: the healthy state is restored, the peak learning rate
+        halved, and the epoch repeated, at most three times per run. Every
+        rewind is counted in the table, so a row with $0/3$ was never touched
+        by the rule. If the budget is exhausted the run is evaluated at its
+        last healthy weights and labelled \emph{abort} --- the second
+        attempt evaluated the destroyed weights instead, which produced
+        numbers (15.6 bits/dim, 1916 failures in 10000) that measure nothing.
   \item \textbf{Measurement systems} (all with analytic SVD):
         \texttt{denoise} ($A = I$, no null space);
         \texttt{inpaint\_box} (centred $12\times12$ hole, 144 null dims);
@@ -905,6 +989,23 @@ coefficients}
         space is exactly the detail bands that downsampling discards). Masks
         are fixed rather than resampled per image: the system is known and
         fixed, as in the supervised bridge setting.
+  \item \textbf{Ablations: Gaussian input noise.} The TarFlow paper's
+        generative recipe replaces uniform dequantization by additive
+        Gaussian noise on the input. Under the $a(a-1) = v/\tau^2$ analysis
+        that sets $\tau$ to the noise level and so caps the gain the
+        objective can demand at $\sqrt{v}/\tau_{\mathrm{noise}}$ ($4$ for
+        \texttt{denoise}, $1$ for the $\sigma = 0.05$ systems, against
+        $25$--$90$ with dequantization) and widens the valley in the
+        coupling's shift from $2\times10^{-3}$ to $0.05$. Two runs test
+        whether that alone prevents the collapses: \texttt{denoise\_gauss}
+        against the archived first attempt (official unbounded head,
+        destroyed at epoch 50) and \texttt{inpaint\_random\_gauss} against
+        the second attempt (bounded head, collapsed at epoch 24). Each
+        changes only the input noise and keeps its control's sampled target
+        and zero rewind budget. Their bpd is not a data likelihood (Gaussian
+        input noise breaks the dequantization bound) and their samples carry
+        $0.05$ of noise; they are compared on survival, failure counts and
+        PSNR.
   \item \textbf{Self-tests gate training.} \texttt{measlib.self\_test()} runs
         before any run and aborts on failure. All five systems pass with
         $\|VV^\top - I\|_\infty = 0$, projector idempotence and symmetry
@@ -914,11 +1015,27 @@ coefficients}
   \item \textbf{Metrics.} Conditional bits/dim (the training objective, using
         the official 8-bit dequantization constant); PSNR of the
         pseudo-inverse, of a single posterior sample, and of the posterior
-        mean over draws; and a \textbf{data-consistency} error, the relative
-        range-space disagreement between a posterior sample and $A^{+}y$.
-        The last is measured rather than assumed: nothing architecturally
-        forces $f$ to act like $A^{+}A$ on the range, so whether $f^{-1}$
-        respects the measurement is an empirical test of the central claim.
+        mean over 4 draws, all after clamping to $[-1, 1]$ (for
+        \texttt{denoise} at $\sigma = 0.2$ the clamp alone lifts $A^{+}y$
+        from 20.0 to 22.7 dB, because half of the background noise is below
+        the black level; the figures clamp the same way, so they show only
+        the positive half of the background noise); and a
+        \textbf{data-consistency} error, the
+        relative range-space disagreement between a posterior sample and
+        $A^{+}y$. The last is measured rather than assumed: nothing
+        architecturally forces $f^{-1}$ to keep the range coordinates near
+        the measurement, so whether posterior samples respect it is an
+        empirical test of the central claim.
+  \item \textbf{Robust reporting.} The base quadratic is stiff
+        ($1/v = 25$ at $\sigma = 0.2$, $16/\sigma^2 = 6400$ on the coarse
+        band of \texttt{sr\_4x}), so a single unusual image can legitimately
+        cost tens of bits/dim. A test image is counted as a \emph{failure}
+        if its conditional bpd is non-finite or above 50; the table reports
+        the mean over the remaining images, and the JSON also records the
+        mean over all images (which is $\infty$ if any is), the median and
+        the failure count. Posterior samples that are non-finite are counted
+        and excluded from the PSNR averages rather than silently clamped.
+        The validation curve uses the same convention.
 \end{itemize}
 
 \subsection{Configuration (verbatim)}
@@ -926,8 +1043,9 @@ coefficients}
 
 \subsection{Results}
 \begin{center}
+\resizebox{\textwidth}{!}{%
 \InputIfFileExists{../outputs/step7_system_bridge/data/ranking_table.tex}{}
-  {\emph{not generated yet -- run \texttt{python step7\_system\_bridge.py}.}}
+  {\emph{not generated yet -- run \texttt{python step7\_system\_bridge.py}.}}}
 \end{center}
 
 \IfFileExists{../outputs/step7_system_bridge/figures/bpd_overlay.png}{%
@@ -941,14 +1059,31 @@ coefficients}
 \includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/denoise_posterior.png}
 \caption{\textbf{denoise}. Rows: ground truth; pseudo-inverse $A^{+}y$; three
 posterior samples $f^{-1}(z)$, $z \sim \mathcal{N}(A^{+}y,\Sigma_1)$; posterior
-mean over 8 draws.}
+mean over 8 draws. Display is clamped to $[-1,1]$: $\sigma = 0.2$ is 10\% of
+the intensity range, and the noise row looks milder than that because the
+negative half of the background noise is below the black level.}
 \end{figure}}{}
 
 \IfFileExists{../outputs/step7_system_bridge/figures/inpaint_box_posterior.png}{%
 \begin{figure}[htbp]\centering
 \includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/inpaint_box_posterior.png}
 \caption{\textbf{inpaint\_box}. Rows as above. The null space is the 144
-masked pixels; posterior variation across samples is confined to the hole.}
+masked pixels; posterior variation across samples should be confined to the
+hole.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step7_system_bridge/figures/inpaint_random_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/inpaint_random_posterior.png}
+\caption{\textbf{inpaint\_random}. Rows as above. A fixed 50\% pixel mask;
+the pseudo-inverse row shows the dropped pixels as zeros.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step7_system_bridge/figures/sr_2x_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/sr_2x_posterior.png}
+\caption{\textbf{sr\_2x}. Rows as above. The null space is the three Haar
+detail bands of every $2\times2$ block (768 of 1024 dimensions).}
 \end{figure}}{}
 
 \IfFileExists{../outputs/step7_system_bridge/figures/sr_4x_posterior.png}{%
@@ -957,16 +1092,206 @@ masked pixels; posterior variation across samples is confined to the hole.}
 \caption{\textbf{sr\_4x}. Rows as above. Only an $8\times8$ thumbnail is
 measured; 960 of 1024 dimensions are null space.}
 \end{figure}}{}
+
+\IfFileExists{../outputs/step7_system_bridge/figures/denoise_gauss_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/denoise_gauss_posterior.png}
+\caption{\textbf{Ablation denoise\_gauss}: Gaussian input noise $0.05$ in
+place of dequantization, official unbounded head, sampled target, no rewind.
+Rows as above; the ground-truth row carries the input noise.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step7_system_bridge/figures/inpaint_random_gauss_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/inpaint_random_gauss_posterior.png}
+\caption{\textbf{Ablation inpaint\_random\_gauss}: Gaussian input noise
+$0.05$, bounded head, sampled target, no rewind. Rows as above.}
+\end{figure}}{}
+
+\subsubsection*{Attempt 2 (archived, superseded)}
+Bounded head, $V$ coordinates, sampled target, no rewind budget (hence
+$0/0$); the \texttt{denoise\_gauss} ablation ran directly after it and is
+included. The \texttt{inpaint\_random} and \texttt{sr\_2x} rows are
+evaluations of the destroyed weights and are kept only as the record of the
+collapse; see the Analysis.
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\InputIfFileExists{../outputs/step7_system_bridge/attempt2_bounded_sampled_target/data/ranking_table.tex}{}
+  {\emph{archive not present.}}}
+\end{center}
 \clearpage
 
 \subsection{Analysis}
 \label{sec:step7analysis}
 \begin{itemize}
-  \item \emph{Results pending: the three-system run
-        (\texttt{denoise}, \texttt{inpaint\_box}, \texttt{sr\_4x}) is queued
-        behind step 6 on the single available GPU. This subsection is written
-        once the numbers exist; the table and figures above regenerate
-        automatically from \texttt{outputs/}.}
+  \item \textbf{Two attempts failed before the runs above, in four distinct
+        ways, and the failures are part of the result.} The runs above are
+        the third attempt. The first (flow in pixel coordinates, official
+        unbounded coupling, three systems) is archived in
+        \texttt{outputs/step7\_system\_bridge/failed\_pixelbasis\_unbounded/},
+        the second (bounded coupling, $V$ coordinates, sampled target, no
+        rewind) in \texttt{.../attempt2\_bounded\_sampled\_target/}. Each
+        failure is a property of the objective, not of the seed.
+        \begin{enumerate}
+          \item \emph{Chained exponential overflow.} \texttt{denoise} trained
+                to $1.93$ bits/dim by epoch 49 and was destroyed at epoch 50
+                (train loss $9\times10^{24}$, 92 of 469 batches rejected in
+                that epoch, weights unrecoverable). \texttt{inpaint\_box}
+                trained healthily to $1.79$ bits/dim while, intermittently
+                from epoch 43 on, a single validation image in 4000 drove
+                the validation mean to $10^{16}$--$\infty$.
+                Tracing that image through the checkpoint: block 2 produced
+                $x_a = -11.5$ on one token, so its output was a $10^5$-scale
+                token; block 3, reading that token through the
+                un-normalised residual stream, answered with
+                $x_a = -9582$, and $e^{9582}$ is $\infty$ in fp32. The
+                sampling direction has the same defect: on \texttt{sr\_4x}
+                the reverse pass produced $z_a = +154$ on a sampled context.
+                Nothing about a near-zero base covariance can do this on its
+                own --- a residual of 1 on a variance-$0.0025$ coordinate
+                costs $200$ nats, not $\infty$ --- the flow output has to
+                reach $\sim 10^{19}$ first, and only the multiplicative
+                chain across blocks can get it there. The bounded
+                log-scale removes exactly that chain.
+          \item \emph{Basis mismatch.} \texttt{sr\_4x} trained to the best
+                conditional bpd of the three ($1.28$ bits/dim, no rejected
+                batches) and produced \emph{no} finite posterior sample.
+                Hard-clamping $z_a$ at inference made the samples finite but
+                left them at PSNR 9--12 dB against 15.1 dB for the
+                pseudo-inverse, so this was not the overflow problem in
+                disguise. It is the per-channel-affine limitation of the
+                coupling: in pixel coordinates the base is far from diagonal
+                for average pooling, the forward pass can still reach a good
+                likelihood by using context, but the inverse of such a map on
+                base samples that are correlated in a way the coupling
+                cannot represent is meaningless. Moving the flow to $V^\top x$
+                makes the base diagonal in the coupling's own coordinates.
+          \item \emph{An over-eager abort rule of our own.} The first script
+                aborted a run after three consecutive non-finite validation
+                means, which killed the healthy \texttt{inpaint\_box} run at
+                epoch 66 (test: posterior-mean PSNR 16.3 dB against 15.5 dB
+                for the pseudo-inverse, data-consistency error 0.058,
+                sample variation confined to the hole). One image in 4000
+                makes a mean non-finite without saying anything about the
+                model; the abort now triggers only on training collapse and
+                evaluation reports failure counts instead.
+          \item \emph{Sudden collapse with the bound in place (second
+                attempt).} The bounded coupling in $V$ coordinates fixed
+                what it was built to fix: \texttt{denoise} survived past
+                epoch 50 to $1.743$ bits/dim (5 of 10000 test images fail,
+                23 batches rejected in 120 epochs; posterior mean 27.4 dB
+                against 22.7 dB for $A^{+}y$), and \texttt{inpaint\_box}
+                reached $1.667$ (5 failures; 16.5 dB against 15.5 dB; one
+                transient burst at epoch 62 in which 106 batches were
+                rejected and the training loss rose to 2.07 bits before
+                recovering the next epoch), with every posterior sample
+                finite. But \texttt{inpaint\_random} collapsed at epoch 24
+                and \texttt{sr\_2x} at epoch 52, each from a falling
+                validation curve ($1.97$ and $1.93$ bits/dim the epoch
+                before) with essentially no rejected batches, to a majority
+                of the next epoch rejected and the weights destroyed. The
+                destroyed weights say what broke. On one validation batch
+                their log-scales are ordinary --- every block has
+                $|x_a| < 4.1$, not one coordinate near the bound, the same
+                range as the healthy \texttt{inpaint\_box} model --- but the
+                base residual on the \emph{range} coordinates,
+                $(f(x) - A^{+}y)_i/\sqrt{v_i}$, has RMS $10.5$
+                (\texttt{inpaint\_random}) and $8.8$ (\texttt{sr\_2x})
+                against $1.4$ for the healthy model, costing $6$ and $38$
+                nats per range coordinate where the healthy model earns
+                $-1.1$; the null coordinates are only mildly worse ($3.7$ and
+                $2.1$ against $1.4$). The scales are fine and the
+                \emph{shifts} are wrong by ten standard deviations, which is
+                the stiffness the $a(a-1) = v/\tau^2$ analysis predicts: a
+                background range coordinate has gain $a \approx \sigma/\tau$,
+                so the coupling's additive output must be accurate to
+                $\tau \approx 2\times10^{-3}$ on hundreds of coordinates at
+                once, while the training gradient with a sampled target is
+                half noise. The expected target removes that noise; the
+                rewind rule catches whatever remains and reports it.
+                \texttt{sr\_4x}, in the same attempt, trained for 120 epochs
+                without a single rejected batch to $1.735$ bits/dim
+                (1 failure in 10000) with every sample finite --- so the
+                basis fix did its job --- but its posterior mean only
+                matched the pseudo-inverse (15.22 against 15.21 dB), a single
+                sample was worse (13.97 dB), and its data-consistency error
+                was $0.106$, twice the floor: with 960 null dimensions and
+                only an $8\times8$ thumbnail measured, the sampled details
+                were noise-like and leaked into the range through context.
+        \end{enumerate}
+  \item \textbf{Third attempt: it trains, and the result is still weak.}
+        With the expected target and the rewind budget every system reached
+        epoch 120. \texttt{inpaint\_random}, which had collapsed at epoch 24
+        before, ran to epoch 65 before the validation curve jumped from
+        $1.62$ to $6.22$ bits/dim; the rewind rule restored epoch 64, halved
+        the peak learning rate, and the run finished at $1.488$ bits/dim
+        (2 failures in 10000, 8 rejected batches, posterior mean 18.5 dB
+        against 9.3 dB for the zero-filled pseudo-inverse). \texttt{sr\_2x},
+        which had collapsed at epoch 52, needed no rewind (14 rejected
+        batches) and reached $1.636$ bits/dim, but its samples are worse
+        than the pseudo-inverse in PSNR (17.2 dB single, 18.3 dB mean,
+        against 19.2 dB), a few of them carry visible $4\times4$ block
+        artifacts, and its data-consistency error is $0.152$, three times
+        the floor of $0.053$. \texttt{sr\_4x} reproduced attempt 2 almost
+        exactly ($1.744$ bits/dim, posterior mean 15.3 dB against 15.2 dB
+        for $A^{+}y$, data consistency $0.102$): the expected target changed
+        nothing where nothing had been unstable. \texttt{denoise} reached
+        $1.735$ bits/dim with a posterior mean of 27.5 dB against 22.7 dB,
+        its data consistency $0.217$ at the floor of $0.207$.
+        \texttt{inpaint\_box} also reproduced attempt 2 ($1.663$ bits/dim,
+        4 rejected batches instead of 109, posterior mean 16.6 dB against
+        15.5 dB, data consistency $0.054$ at the floor: its 144-pixel hole
+        is small enough that the sampled content cannot leak much). Two
+        facts summarise the attempt. First, on the three systems with a
+        large null space the data-consistency error is two to three times
+        the noise floor, i.e.\ the sampled null content leaks into the range
+        through context-dependent shifts, and on \texttt{sr\_2x} and
+        \texttt{sr\_4x} the posterior mean does not beat the pseudo-inverse. Second, every conditional bits/dim in the
+        table, $1.49$--$1.74$, is \emph{above} the unconditional
+        $1.171$ bits/dim that the same architecture, budget and
+        dequantization reach on MNIST without any measurement (step 4,
+        \texttt{baseline\_flip}). For the true densities
+        $H(X|Y) \le H(X)$, so a well-fit conditional model must come in
+        below the unconditional one; these do not, by 0.3--0.6 bits/dim.
+        Part of the gap on the super-resolution systems is the Haar basis
+        the flow is forced into (step 5 measured that cost), but
+        \texttt{denoise} and \texttt{inpaint\_random} act in pixel
+        coordinates and are above the line by the same margin. The
+        unconditional-$f$ construction is paying for the measurement rather
+        than profiting from it, which is what the $a(a-1) = v/\tau^2$
+        analysis says it must do on stiff range coordinates. Step 8 drops
+        the construction and conditions $f$ on $A^{+}y$ directly.
+  \item \textbf{Gaussian input noise alone prevents the denoise collapse.}
+        \texttt{denoise\_gauss} differs from the archived first-attempt
+        \texttt{denoise} run (destroyed at epoch 50) only by Gaussian input
+        noise of $0.05$ in place of dequantization: the head is the official
+        unbounded one, the target is sampled, and there is no rewind. It
+        trained for 120 epochs with \emph{zero} rejected batches, no test
+        failure in 10000, every sample finite, and posterior-mean PSNR of
+        29.6 dB against 23.1 dB for $A^{+}y$ (measured against the noisy
+        input, whose own noise caps PSNR near 32 dB). Its 5.25 bits/dim is
+        not comparable with the dequantized runs. This is the outcome the
+        $a(a-1) = v/\tau^2$ analysis predicts --- with $\tau = 0.05$ the
+        objective asks for gains of at most 4 and tolerates shift errors 25
+        times larger --- and it is the cheapest stabiliser found here; its
+        price is the loss of the likelihood interpretation and $0.05$ of
+        residual noise in every sample (removable with a Tweedie step
+        $x + \tau^2 \nabla_x \log p(x|y)$, which the flow supplies exactly,
+        not done here). \texttt{inpaint\_random\_gauss} --- the system that
+        collapsed at epoch 24 in attempt 2, run again with Gaussian input
+        noise $0.05$, the bounded head, the \emph{sampled} target and no
+        rewind --- confirms it: 120 epochs, zero rejected batches, no test
+        failure, every sample finite, and a posterior mean of 26.3 dB
+        (single sample 24.4 dB) against 9.5 dB for the zero-filled
+        pseudo-inverse and 18.5 dB for the dequantized attempt-3 model of
+        the same system, with data consistency $0.059$ at the floor instead
+        of $0.140$. Against the noisy input the ceiling is about 32 dB. So
+        on this system the unconditional bridge is not a bad model; the
+        dequantized objective is a badly conditioned one. This is the
+        strongest step-7 result and it is the one that gives up the
+        data likelihood. Whether the same holds for the super-resolution
+        systems, where the leak is largest, was not run: step 8 makes the
+        comparison moot by removing the stiffness at the source.
   \item \textbf{What the conditional bpd does and does not mean.}
         $-\log p(x|y)/(D\ln 2)$ is a conditional quantity: it falls trivially
         as the measurement becomes more informative, so it is comparable
@@ -977,13 +1302,28 @@ measured; 960 of 1024 dimensions are null space.}
         $-\tfrac{1}{2}\log\det\Sigma_1$ is included in every reported number,
         as it must be for the value to be a likelihood --- it is easy to drop
         because it does not affect gradients.
-  \item \textbf{The falsifiable claims.} (i) Data-consistency error should be
-        small: if $f$ has learned to act like $A^{+}A$ on the range, posterior
-        samples reproduce the measurement without any projection step being
-        imposed. (ii) Posterior samples should differ from each other only in
-        the null space. (iii) The posterior mean should beat a single sample
-        on PSNR while being blurrier, the usual MMSE-versus-sample trade-off.
-        Each is measured directly and any failure is reported.
+  \item \textbf{The falsifiable claims.} (i) Data-consistency error should
+        sit at the \emph{measurement-noise floor}. The floor is not zero:
+        the ground truth itself disagrees with $A^{+}y$ on the range by
+        $A^{+}n$, which on the test set is a relative error of $0.207$ for
+        \texttt{denoise} ($\sigma = 0.2$) and $0.051$--$0.055$ for the four
+        $\sigma = 0.05$ systems, and a raw base sample ($f = \mathrm{id}$)
+        sits at the same values because $\gamma = 1$ makes the base's range
+        noise equal to the measurement noise. By the $a(a-1) = v/\tau^2$
+        analysis a converged flow pulls prior-dominated coordinates to the
+        prior and leaves measurement-dominated ones alone, so its samples
+        also sit at the floor. The metric therefore cannot distinguish a
+        converged flow from the identity; what it \emph{can} do is expose a
+        sampler that corrupts the range through context-dependent shifts on
+        badly sampled null content (after two epochs on \texttt{sr\_4x} it
+        read $0.17$, three times the floor). (ii) Posterior samples should
+        differ from each other mainly in the null space. (iii) The posterior
+        mean should beat a single sample on PSNR while being blurrier, the
+        usual MMSE-versus-sample trade-off; and for \texttt{denoise} the
+        single sample should already beat $A^{+}y$, since the analysis
+        predicts near-zero error on background pixels and roughly $2v$ on
+        foreground ones against $v$ everywhere for the pseudo-inverse. Each
+        is measured directly and any failure is reported.
   \item \textbf{Honest framing relative to SDB.} This is a bridge in the sense
         that the base is the pseudo-inverse distribution rather than white
         noise; it is \emph{not} a stochastic process with intermediate
@@ -1010,6 +1350,356 @@ measured; 960 of 1024 dimensions are null space.}
         patches costs likelihood, so this is a genuine open question rather
         than an obvious win; the SVD ordering is not used in the runs above,
         which keep the official ordering throughout.
+\end{itemize}
+
+\section{Step 8: Conditional TarFlow on the pseudo-inverse}
+\label{sec:step8}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step8\_conditional\_flow.py} +
+        \texttt{invlib.condition\_on\_image} + \texttt{measlib.DenseSystem} /
+        \texttt{CTParallel}; config: \texttt{configs/step8\_conditional\_flow.yml};
+        outputs: \texttt{outputs/step8\_conditional\_flow/\{data,figures\}/}.
+  \item \textbf{Why.} Step 7 embedded the measurement in the base density and
+        kept $f$ unconditional. After three attempts it trains, but the
+        outcome is weak: its conditional bits/dim (1.49--1.81 across systems)
+        sit \emph{above} the unconditional MNIST number of the same model,
+        budget and dequantization (1.171, step 4 \texttt{baseline\_flip}),
+        which is impossible for a well-fit conditional density since
+        $H(X|Y) \le H(X)$; its data-consistency error sits at about three
+        times the measurement-noise floor; and on \texttt{sr\_4x} its
+        posterior mean does not beat the pseudo-inverse. The
+        $a(a-1) = v/\tau^2$ analysis of \S\ref{sec:step7analysis} explains
+        why: an unconditional $f$ can only use the measurement by expanding
+        stiff range coordinates, which is what makes the objective hard to
+        optimise. The obvious alternative is to let $f$ \emph{see} the
+        measurement. This step does exactly that, and nothing else.
+  \item \textbf{Model.} An official TarFlow with the standard-normal base
+        and the official bits/dim, whose coupling networks receive the
+        pseudo-inverse reconstruction as an extra, image-shaped input:
+        \[
+          \log p(x|y) = \log \mathcal{N}\!\left(f(x;\,A^{+}y);\,0,\,I\right)
+                        + \log\left|\det J_f(\,\cdot\,;A^{+}y)\right| .
+        \]
+        For every fixed $y$ the map $x \mapsto f(x; A^{+}y)$ is a bijection,
+        so this is a proper conditional density trained by exact maximum
+        likelihood on $(x, y)$ pairs with $y = Ax + \sigma\epsilon$ drawn fresh
+        at every step; a posterior sample is $x = f^{-1}(z; A^{+}y)$ with
+        $z \sim \mathcal{N}(0, I)$. Nothing is stiff: the measurement noise
+        lives in the conditioning input, where the network is free to learn
+        to ignore it, not in the density's target. There is no whitening,
+        no $V$ basis and no closed-form expected target.
+  \item \textbf{Why $A^{+}y$ and not $y$.} The conditioning has to be
+        concatenated with the image, so it must have the image's shape; $y$
+        does not in general --- $A$ is rectangular, and for CT $y$ is a
+        sinogram. $A^{+}y$ always has the image's shape whatever $y$ is,
+        it carries the same information as $y$ on the range of $A$ (the
+        pseudo-inverse is injective on the range, so no information is lost
+        beyond what the noise already destroyed), and it is the natural
+        ``first guess'' that the flow then corrects. On the null space it is
+        identically zero, which the network can only read as ``unmeasured''.
+  \item \textbf{How the conditioning enters (\texttt{invlib.condition\_on\_image}).}
+        $A^{+}y$ is patchified like the image ($T = 64$ tokens of 16 pixels),
+        embedded by its own linear projection and positional table, and
+        \emph{prepended} to the token sequence as a prefix of length $T$. The
+        attention mask over the $2T$ tokens lets every prefix token attend
+        to the whole prefix, and every image token attend to the whole prefix
+        and, causally, to itself and earlier image tokens. The output at the
+        last prefix position supplies the affine parameters of image token 0
+        (the official model uses zeros there), and the output at image token
+        $i$ those of token $i+1$, exactly as in the official shift-by-one.
+        The coupling $z = (x - x_b)e^{-x_a}$, the per-block permutations, the
+        log-determinant $-\bar{x}_a$ and the KV-cached sampling loop are the
+        official ones; sampling first pushes the prefix through the cache
+        and then runs the official one-token-at-a-time loop, so the map is
+        exactly invertible for every conditioning image. The conditioning
+        image is permuted with the same flip as the image in every block, so
+        prefix token $i$ always describes the same patch as image token $i$.
+        \texttt{ml-tarflow} is not modified: blocks are re-classed at runtime
+        and gain one $16 \times 128$ linear layer and one $64 \times 128$
+        positional table each, $41{,}472$ parameters in total on top of the
+        $1{,}644{,}160$ of the model (2.5\%). The sequence length doubles,
+        so attention costs about four times as much per block as in step 7.
+  \item \textbf{Log-scale bound and its ablation.} The likelihood does not
+        need a bounded coupling head here (the base is $\mathcal{N}(0, I)$),
+        but the \emph{sampling} direction can still overflow: for $z$ off the
+        data manifold, $e^{z_a}$ chained across four blocks can reach
+        \texttt{inf} in an under-trained or extrapolating head. In a
+        32-step smoke test on \texttt{sr\_4x} the official unbounded head
+        produced 60 of 64 non-finite posterior samples while the forward
+        map round-tripped to $4 \times 10^{-6}$; the bounded head
+        ($8\tanh(x_a/8)$ in both directions, step 7's construction) produced
+        0 of 64. The bound is the default; the \texttt{sr\_4x\_unbounded}
+        system re-runs \texttt{sr\_4x} with the official head to measure its
+        effect on a trained model rather than assume it.
+  \item \textbf{Training-loop safeguards.} The batch-rejection rule
+        ($\ell > 5\,\mathrm{ema} + 5$ nats/dim) and the rewind-on-collapse
+        budget of step 7 (restore last healthy epoch, halve peak learning
+        rate, at most twice) are kept verbatim so that a difference between
+        the two steps cannot be attributed to the loop; both counts are
+        reported per system and are expected to stay near zero.
+  \item \textbf{A rectangular system: sparse-view parallel-beam CT
+        (\texttt{measlib.DenseSystem}, \texttt{CTParallel}).} Every step-7
+        system had an implicit SVD (pixel masks, Haar averaging). To exercise
+        the rectangular case the library gains a generic operator built from
+        an explicit matrix $A \in \mathbb{R}^{M \times D}$ and a numerical
+        SVD, with a \emph{truncated} pseudo-inverse: singular values below
+        $10^{-2}\,s_{\max}$ are treated as zero, so $A^{+}$ never amplifies
+        the noise by more than $100\times$ and the corresponding directions
+        join the null space. \texttt{radon\_matrix} is a pixel-driven
+        parallel-beam projector (every pixel centre projected onto the
+        detector axis of every view at angles $\pi a/n_{\mathrm{angles}}$,
+        linearly split between its two neighbouring bins). The
+        \texttt{ct\_sparse} system uses 8 views and 47 bins: $y$ is an
+        $8 \times 47$ sinogram, $A$ is $376 \times 1024$, 290 singular values
+        are kept, 86 are truncated, and 734 of 1024 dimensions are null
+        space. The noise is $\sigma = 0.5$ in sinogram units (a ray through
+        the $[-1,1]$-scaled background sums to about $-32$, so this is
+        roughly 1.5\% of a ray sum). The pseudo-inverse reconstruction is
+        the familiar streaky sparse-view image at 17.8 dB (first 64 test
+        images), and the data-consistency floor --- the relative range-space
+        discrepancy between the truth and $A^{+}y$, which a perfect sample
+        would also show --- is $0.187$ (against $0.203$ for \texttt{denoise}
+        and $0.051$--$0.055$ for the $\sigma = 0.05$ systems on the same
+        images).
+  \item \textbf{Verification (\texttt{--verify-only}, run before every
+        training job).} On an $8 \times 8$ image with patch 4 ($T = 4$),
+        64 channels, and randomly perturbed weights so that the coupling is
+        far from the identity, for three configurations (two blocks with and
+        without the bound, one block unbounded), in float32: (1) inversion
+        given the conditioning image, $9.5 \times 10^{-7}$; (2) the reported
+        log-determinant against $\log|\det J|/D$ from the autograd Jacobian,
+        $2.8 \times 10^{-8}$; (3) $z$ depends on the conditioning image
+        (relative change $1.55$ when it is perturbed); (4) the autoregressive
+        structure is intact in a single block --- perturbing image token $j$
+        leaves $z$ tokens $< j$ unchanged, and perturbing any conditioning
+        token changes every image token. The official LayerNorm casts to
+        float32, so the check cannot be run in double; the tolerance is
+        $10^{-4}$ and every value is two or more orders below it.
+  \item \textbf{Metrics, identical to step 7.} Conditional bits/dim on the
+        full 10k test set with a fresh measurement per image, with the
+        robust statistics of step 7 (values above 50 counted as failures);
+        PSNR of $A^{+}y$, of one posterior sample and of the mean of four
+        draws, after clamping to $[-1,1]$, on the first 64 test images;
+        relative data-consistency error $\|A^{+}A\hat{x} - A^{+}y\| /
+        \|A^{+}y\|$ of one sample; non-finite samples counted and excluded.
+        The same test images and the same generator seed are used, and the
+        PSNR of $A^{+}y$ in the table below reproduces the step-7 values to
+        the last digit, which is the check that the two tables are on the
+        same footing.
+  \item \textbf{The falsifiable claims.} (i) The conditional bits/dim must
+        fall \emph{below} 1.171 for every system, because a conditional
+        density can only be sharper, and by more for more informative
+        measurements. (ii) On the five systems shared with step 7 it must
+        beat step 7 at equal model, budget and data. (iii) The
+        data-consistency error should sit at the floor given above, not at
+        three times it. (iv) Posterior mean $>$ single sample $>$ $A^{+}y$
+        in PSNR, except that for a near-noiseless measurement a sample is
+        allowed to tie the pseudo-inverse. (v) For CT the samples must remove
+        the streaks while agreeing with the sinogram. (vi) The unbounded
+        ablation should match the bounded run in bits/dim; any non-finite
+        samples are reported.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step8_conditional_flow.yml}}
+
+\subsection{Results}
+Systems are sorted by conditional bits/dim. \texttt{meas} is the number of
+measurements $M$ (376 for the sinogram, the number of kept pixels or
+thumbnail pixels otherwise); \texttt{null dims} the null-space dimension
+(including truncated singular directions for CT); \texttt{fail} the test
+images with bits/dim above 50; \texttt{rewinds} the rewinds used of the
+budget.
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\InputIfFileExists{../outputs/step8_conditional_flow/data/ranking_table.tex}{}
+  {\emph{not generated yet -- run \texttt{python step8\_conditional\_flow.py}.}}}
+\end{center}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/bpd_overlay.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.8\textwidth]{outputs/step8_conditional_flow/figures/bpd_overlay.png}
+\caption{Validation conditional bits/dim per epoch for each measurement
+system (left: whole run; right: epochs 61--120). The dashed line is the
+unconditional test value of the same model, budget and dequantization
+(step 4 \texttt{baseline\_flip}, 1.171); every curve ends below it.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/ct_sparse_measurements.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{outputs/step8_conditional_flow/figures/ct_sparse_measurements.png}
+\caption{\textbf{ct\_sparse}: the measurements themselves --- $8 \times 47$
+sinograms (views $\times$ bins) of the eight test images in the next figure.
+These cannot be concatenated with a $32 \times 32$ image; the flow is
+conditioned on their pseudo-inverse instead.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/ct_sparse_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step8_conditional_flow/figures/ct_sparse_posterior.png}
+\caption{\textbf{ct\_sparse}. Rows: ground truth; truncated pseudo-inverse
+$A^{+}y$ (8-view streaks); three posterior samples $f^{-1}(z; A^{+}y)$,
+$z \sim \mathcal{N}(0,I)$; posterior mean over 8 draws. Display clamped to
+$[-1,1]$.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/sr_4x_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step8_conditional_flow/figures/sr_4x_posterior.png}
+\caption{\textbf{sr\_4x}. Rows as above. Only an $8 \times 8$ thumbnail is
+measured (960 null dimensions); compare the step-7 figure for the same
+images.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/inpaint_box_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step8_conditional_flow/figures/inpaint_box_posterior.png}
+\caption{\textbf{inpaint\_box}. Rows as above; the $12 \times 12$ hole is the
+null space.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/inpaint_random_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step8_conditional_flow/figures/inpaint_random_posterior.png}
+\caption{\textbf{inpaint\_random}. Rows as above; a fixed 50\% pixel mask.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/sr_2x_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step8_conditional_flow/figures/sr_2x_posterior.png}
+\caption{\textbf{sr\_2x}. Rows as above; 768 null dimensions.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/denoise_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step8_conditional_flow/figures/denoise_posterior.png}
+\caption{\textbf{denoise}, $\sigma = 0.2$. Rows as above; no null space.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step8_conditional_flow/figures/sr_4x_unbounded_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step8_conditional_flow/figures/sr_4x_unbounded_posterior.png}
+\caption{\textbf{Ablation sr\_4x\_unbounded}: the official unbounded
+coupling head. Rows as above; non-finite samples, if any, are shown as
+zeros.}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step8analysis}
+\begin{itemize}
+  \item \textbf{Every falsifiable claim held, on every system, at the first
+        attempt.} Six systems, one script, no rewind used, 1--6 rejected
+        batches per 120-epoch run, at most 3 test failures in 10000, every
+        posterior sample finite, 16.6--17.1 minutes per system. Conditional
+        bits/dim: \texttt{denoise} 0.994, \texttt{inpaint\_random} 0.994,
+        \texttt{sr\_2x} 0.999, \texttt{inpaint\_box} 1.024,
+        \texttt{ct\_sparse} 1.070, \texttt{sr\_4x} 1.104 --- all below the
+        unconditional 1.171 (claim i), all 0.6--0.7 bits/dim below the
+        step-7 bridge on the five shared systems (claim ii: 1.735, 1.488,
+        1.636, 1.663, 1.744). Posterior mean $>$ sample $>$ $A^{+}y$ in
+        PSNR on every system with no exception needed (claim iv): the mean
+        gains 4.0 dB (\texttt{inpaint\_box}), 4.6 (\texttt{sr\_4x}), 8.1
+        (\texttt{ct\_sparse}), 8.2 (\texttt{denoise}), 8.9 (\texttt{sr\_2x})
+        and 17.1 dB (\texttt{inpaint\_random}) over the pseudo-inverse,
+        against step 7's $+1.1$, $+0.1$, ---, $+4.8$, $-0.9$ and $+9.1$ dB.
+        The two systems on which step 7's samples were worse than or tied
+        with the pseudo-inverse (\texttt{sr\_2x}, \texttt{sr\_4x}) gain
+        9.8 and 4.4 dB on the posterior mean relative to step 7, and the
+        $4\times4$ block artifacts of the step-7 \texttt{sr\_2x} samples are
+        gone.
+  \item \textbf{Data consistency (claim iii).} Relative to the floor
+        measured on the same images, the sampled range-space error is
+        $1.01\times$ (\texttt{denoise}), $1.07\times$ (\texttt{ct\_sparse}),
+        $1.14\times$ (\texttt{inpaint\_box}), $1.23\times$ (\texttt{sr\_2x}),
+        $1.4\times$ (\texttt{inpaint\_random}) and $1.5\times$
+        (\texttt{sr\_4x}), against $2$--$3\times$ for the step-7 bridge on
+        the three large-null-space systems. It is at the floor where the
+        measurement pins most of the image and drifts above it as the null
+        space grows, which is the expected signature of a sampler that
+        generates null content with context and lets a little of it leak
+        into the range; the leak is not enforced away (nothing projects the
+        sample back onto $A^{+}y$), it is only learned away, and with 960
+        null dimensions it is learned to within 50\%. A hard projection
+        $x \leftarrow x - A^{+}(Ax - y)$ after sampling would remove the
+        residual exactly at the cost of the likelihood interpretation; it
+        is not applied here so that the numbers measure the model.
+  \item \textbf{The rectangular case works (claim v) and costs nothing
+        extra.} \texttt{ct\_sparse} conditions on the truncated
+        pseudo-inverse of an $8 \times 47$ sinogram --- the measurement
+        never touches the network in its own shape --- and produces
+        streak-free digits at 23.7 dB per sample and 25.9 dB for the mean,
+        from a pseudo-inverse at 17.8 dB, with data consistency at
+        $1.07\times$ the floor. The variation between draws is confined to
+        strokes that eight views leave ambiguous. The system is treated by
+        the same code path as the others: \texttt{DenseSystem} needs only
+        the matrix, and the flow needs only that $A^{+}y$ has the image's
+        shape.
+  \item \textbf{The bits/dim gap measures the information in the
+        measurement.} With both models trained on the same data to the
+        same budget, $\mathrm{bpd}_{\mathrm{uncond}} -
+        \mathrm{bpd}_{\mathrm{cond}}$ estimates $I(X;Y)/(D\ln 2)$, the
+        mutual information per pixel between image and measurement under
+        the model (an estimate, not a bound: both terms are cross-entropies
+        that upper-bound their respective entropies). Per image:
+        \texttt{denoise} 181 bits, \texttt{inpaint\_random} 181,
+        \texttt{sr\_2x} 176, \texttt{inpaint\_box} 151, \texttt{ct\_sparse}
+        104, \texttt{sr\_4x} 68. The ranking is not by the number of
+        measurements --- \texttt{inpaint\_box} measures 880 pixels and
+        \texttt{sr\_2x} 256 --- but by what they say about the part of the
+        image that is uncertain: the centred hole removes exactly the
+        pixels that carry the digit, while a $2\times$ thumbnail constrains
+        every stroke a little. The measurement count in the table is the
+        dimension of the range; the bits/dim gap is its value. Note also
+        that the six conditional values span only $0.11$ bits/dim, from a
+        measurement that pins the whole image at $\sigma = 0.2$ to one that
+        keeps 64 numbers of 1024: MNIST at 32 px has few bits to give, and
+        an eight-view sinogram already takes more than half of what full
+        denoising takes.
+  \item \textbf{The bound costs nothing measurable and buys finite samples
+        (claim vi).} \texttt{sr\_4x\_unbounded} --- the official coupling
+        head, otherwise identical --- reached 1.097 bits/dim against 1.104
+        with the bound (a 0.007 difference on one seed; its validation
+        curve sits on top of the bounded one throughout), with the same
+        rejected-batch count (1), the same failure count (1 in 10000), and
+        PSNR and data consistency equal within 0.1 dB and 0.001. But 2 of
+        the 64 test images produced a non-finite posterior sample in one of
+        four draws, where the bounded head produced none in $6 \times 256$
+        draws across the six systems; the sample and mean PSNR of the
+        unbounded run (17.7 and 19.9 dB) are computed on the 62 images that
+        stayed finite. On an untrained model the same head gave 60 of 64
+        non-finite samples (Methods). So the overflow in the sampling
+        direction is real, it is rare on a trained model, and it is
+        removed by a $\tanh$ at zero cost in likelihood. The bound stays on
+        by default; the table keeps both rows.
+  \item \textbf{What this says about step 7.} The bridge was not wrong ---
+        it is a valid conditional density and it trains --- but it makes
+        the measurement expensive to use: the flow has to \emph{expand}
+        stiff range coordinates to import the prior, which is the source of
+        every instability documented in \S\ref{sec:step7analysis}, and it
+        arrives at a conditional likelihood worse than ignoring the
+        measurement. Giving the coupling networks $A^{+}y$ as an input
+        makes the same information free: the network reads the measurement
+        where it is well determined and generates where it is not, with the
+        standard-normal base, the official coupling and the official
+        objective, and with the \texttt{inpaint\_random\_gauss} ablation's
+        reconstruction quality \emph{without} giving up the data likelihood.
+        The prefix costs 2.5\% of the parameters and 33\% of the epoch time.
+        The one thing the bridge keeps that this construction lacks is the
+        physics in the base density: a model trained here is tied to its
+        $A$ exactly as step 7's was, and conditioning on $A^{+}y$ alone
+        gives it no mechanism to recognise a different operator. Training
+        across a family of operators (a random view count, a random mask)
+        is the obvious next experiment and needs no new code.
+  \item \textbf{Limits of what was measured.} One dataset at 32 px, one
+        seed, one model size, and 64 test images for the sample metrics;
+        the validation curves were still falling at epoch 120 on every
+        system (best epoch 113--120), so none of the numbers is converged.
+        The DC-error metric is the only measurement of range fidelity and it
+        is a single-sample average; sample diversity in the null space is
+        shown in the figures but not quantified.
 \end{itemize}
 
 \section{Reproducibility}
@@ -1044,6 +1734,19 @@ measured; 960 of 1024 dimensions are null space.}
   {\emph{provenance.json not generated yet.}}
 \IfFileExists{../outputs/step4_tarflow_ablation/data/provenance.json}
   {\verbatiminput{../outputs/step4_tarflow_ablation/data/provenance.json}}
+  {\emph{provenance.json not generated yet.}}}
+
+\begin{itemize}
+  \item Provenance for steps 7 and 8 (both include the pinned ml-tarflow
+        commit; step 7's is that of the third attempt, the archived attempts
+        carry their own):
+\end{itemize}
+{\scriptsize
+\IfFileExists{../outputs/step7_system_bridge/data/provenance.json}
+  {\verbatiminput{../outputs/step7_system_bridge/data/provenance.json}}
+  {\emph{provenance.json not generated yet.}}
+\IfFileExists{../outputs/step8_conditional_flow/data/provenance.json}
+  {\verbatiminput{../outputs/step8_conditional_flow/data/provenance.json}}
   {\emph{provenance.json not generated yet.}}}
 
 \end{document}

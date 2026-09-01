@@ -28,11 +28,14 @@ NOTE sigma > 0 is REQUIRED. With sigma = 0 the range block of Sigma_1 is
 singular, the base density degenerates to a delta on the range, and the flow
 likelihood is undefined. Physically this is just "every measurement has noise".
 
-Implemented systems (all with analytic SVD, no matrix ever formed):
+Implemented systems (analytic SVD, no matrix ever formed):
     denoise         A = I                      (no null space)
     inpaint_box     A = diag(mask), centre box removed
     inpaint_random  A = diag(mask), random pixels removed
     sr_2x / sr_4x   A = 2x2 / 4x4 average pooling  (V = block Haar)
+and, with an explicit matrix and a numerical (truncated) SVD:
+    ct              sparse-view parallel-beam CT; y is a SINOGRAM, a different
+                    shape from the image (A is rectangular)
 
 Run `python measlib.py` to execute the self-tests.
 """
@@ -97,20 +100,32 @@ class LinearMeasurement:
         noisy = c + self.sigma / s.clamp_min(1e-12) * eps
         return self.basis_inv(torch.where(s > 0, noisy, torch.zeros_like(c)))
 
-    def sample_base(self, xhat, generator=None):
-        """Draw z ~ N(A^+y, Sigma_1) given the pseudo-inverse recon xhat."""
-        c = self.basis_fwd(xhat)
-        v = self.base_var(c.device, c.dtype)
-        eps = torch.randn(c.shape, device=c.device, dtype=c.dtype, generator=generator)
-        return self.basis_inv(c + v.sqrt() * eps)
+    # -- the base density, in V coordinates ---------------------------------
+    # The flow is trained in V coordinates (c = V^T x): TarFlow's coupling is
+    # elementwise within a token and never mixes channels, so it can only match
+    # a base that is DIAGONAL in the coordinates it sees. Sigma_1 is diagonal in
+    # V, not in pixels -- for the pooling systems the pixels of one patch are
+    # strongly correlated under Sigma_1 -- so the flow acts on c and the
+    # pixel-space methods below are thin wrappers.
+    def coef_sample_base(self, cm, generator=None):
+        """Draw c_z ~ N(cm, diag Sigma_1) given cm = V^T A^+y."""
+        v = self.base_var(cm.device, cm.dtype)
+        eps = torch.randn(cm.shape, device=cm.device, dtype=cm.dtype, generator=generator)
+        return cm + v.sqrt() * eps
 
-    def base_logprob(self, z, xhat):
-        """log N(z; A^+y, Sigma_1), summed over dims, per example."""
-        cz = self.basis_fwd(z)
-        cm = self.basis_fwd(xhat)
+    def coef_logprob(self, cz, cm):
+        """log N(cz; cm, diag Sigma_1), summed over dims, per example."""
         v = self.base_var(cz.device, cz.dtype)
         ll = -0.5 * ((cz - cm) ** 2 / v + torch.log(2 * math.pi * v))
         return ll.flatten(1).sum(-1)
+
+    def sample_base(self, xhat, generator=None):
+        """Draw z ~ N(A^+y, Sigma_1) given the pseudo-inverse recon xhat."""
+        return self.basis_inv(self.coef_sample_base(self.basis_fwd(xhat), generator))
+
+    def base_logprob(self, z, xhat):
+        """log N(z; A^+y, Sigma_1), summed over dims, per example."""
+        return self.coef_logprob(self.basis_fwd(z), self.basis_fwd(xhat))
 
     def logdet_sigma(self):
         """log det Sigma_1 -- constant given the system; needed for honest bpd."""
@@ -194,12 +209,107 @@ class AveragePoolSR(LinearMeasurement):
         return invlib.HaarPyramid2D._idwt(c, self.levels)
 
 
+class DenseSystem(LinearMeasurement):
+    """Any linear system given by an explicit matrix A (M x D), M != D allowed.
+
+    The SVD is computed once (D = 1024 for 32x32 images, instantaneous). The
+    measurement y = A x + sigma eps lives in R^M -- a different shape from the
+    image in general -- but everything the flow ever sees, A^+ y and A^+A x,
+    is image-shaped, which is the point of conditioning on the pseudo-inverse.
+
+    Singular values below rcond * s_max are treated as zero (a TRUNCATED
+    pseudo-inverse, numpy's convention): those directions are measured so
+    weakly that A^+ would amplify the noise by more than 1/rcond, and they are
+    handed to the null space -- i.e. to the prior -- instead.
+    """
+
+    def __init__(self, A, shape, sigma, gamma=1.0, beta=1.0, rcond=1e-2, name="dense"):
+        super().__init__(shape, sigma, gamma, beta, name=name)
+        A = A.to(torch.float64)
+        D = int(torch.tensor(shape).prod())
+        assert A.shape[1] == D, (A.shape, shape)
+        U, s, Vh = torch.linalg.svd(A, full_matrices=True)     # Vh is D x D
+        s_full = torch.zeros(D, dtype=torch.float64)
+        keep = s >= rcond * s.max()
+        s_full[:s.numel()][keep] = s[keep]
+        self.A, self.Vh = A, Vh
+        self.n_meas, self.rcond = int(A.shape[0]), float(rcond)
+        self.n_truncated = int((~keep).sum())
+        self._s = s_full.reshape(shape)
+        self._Vh_dev = {}
+
+    def _vh(self, device, dtype):
+        key = (str(device), dtype)
+        if key not in self._Vh_dev:
+            self._Vh_dev[key] = self.Vh.to(device=device, dtype=dtype)
+        return self._Vh_dev[key]
+
+    def basis_fwd(self, x):
+        Vh = self._vh(x.device, x.dtype)
+        return (x.flatten(1) @ Vh.T).reshape(x.shape)
+
+    def basis_inv(self, c):
+        Vh = self._vh(c.device, c.dtype)
+        return (c.flatten(1) @ Vh).reshape(c.shape)
+
+    def measure(self, x, generator=None):
+        """y = A x + sigma eps in measurement space (M,), for display only."""
+        A = self.A.to(device=x.device, dtype=x.dtype)
+        y = x.flatten(1) @ A.T
+        return y + self.sigma * torch.randn(y.shape, device=y.device, dtype=y.dtype,
+                                            generator=generator)
+
+    def __repr__(self):
+        return (super().__repr__()[:-1] + f", meas={self.n_meas}, rcond={self.rcond}, "
+                f"truncated={self.n_truncated})")
+
+
+def radon_matrix(N, n_angles, n_det=None):
+    """Pixel-driven parallel-beam Radon transform of an N x N image.
+
+    Each pixel centre is projected onto the detector axis of every view and its
+    value shared between the two nearest detector bins by linear interpolation
+    (unit pixel and detector spacing). Views are equally spaced over [0, pi).
+    Returns A of shape (n_angles * n_det, N * N); the sinogram is
+    (n_angles, n_det) -- a shape different from the image, so y and x cannot
+    be concatenated: the pseudo-inverse is what brings y back to image shape.
+    """
+    if n_det is None:
+        n_det = int(math.ceil(N * math.sqrt(2))) | 1     # odd, covers the diagonal
+    u = torch.arange(N, dtype=torch.float64) - (N - 1) / 2
+    yy, xx = torch.meshgrid(u, u, indexing="ij")
+    pix = torch.arange(N * N)
+    A = torch.zeros(n_angles * n_det, N * N, dtype=torch.float64)
+    for a in range(n_angles):
+        th = math.pi * a / n_angles
+        t = (xx * math.cos(th) + yy * math.sin(th)).flatten() + (n_det - 1) / 2
+        i0 = torch.floor(t).long()
+        w1 = t - i0.double()
+        for idx, w in ((i0, 1 - w1), (i0 + 1, w1)):
+            ok = (idx >= 0) & (idx < n_det)
+            A[a * n_det + idx[ok], pix[ok]] += w[ok]
+    return A
+
+
+class CTParallel(DenseSystem):
+    """Sparse-view parallel-beam CT: y is a sinogram (n_angles x n_det)."""
+
+    def __init__(self, shape, sigma, n_angles=16, n_det=None, rcond=1e-2,
+                 gamma=1.0, beta=1.0):
+        C, N, _ = shape
+        assert C == 1, "CT systems are single-channel"
+        A = radon_matrix(N, n_angles, n_det)
+        super().__init__(A, shape, sigma, gamma, beta, rcond, name=f"ct_{n_angles}view")
+        self.n_angles, self.n_det = n_angles, A.shape[0] // n_angles
+
+
 REGISTRY = {
     "denoise": Denoise,
     "inpaint_box": InpaintBox,
     "inpaint_random": InpaintRandom,
     "sr_2x": lambda shape, sigma, **kw: AveragePoolSR(shape, sigma, levels=1, **kw),
     "sr_4x": lambda shape, sigma, **kw: AveragePoolSR(shape, sigma, levels=2, **kw),
+    "ct": CTParallel,
 }
 
 
@@ -226,8 +336,8 @@ def self_test(verbose=True):
     torch.manual_seed(0)
     shape = (1, 16, 16)
     results = {}
-    for nm in ["denoise", "inpaint_box", "inpaint_random", "sr_2x", "sr_4x"]:
-        kw = {"box": 6} if nm == "inpaint_box" else {}
+    for nm in ["denoise", "inpaint_box", "inpaint_random", "sr_2x", "sr_4x", "ct"]:
+        kw = {"inpaint_box": {"box": 6}, "ct": {"n_angles": 8}}.get(nm, {})
         op = build(nm, shape, sigma=0.1, **kw)
         V_t, P = _explicit_matrices(op, shape)
         d = V_t.shape[0]

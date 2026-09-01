@@ -415,6 +415,164 @@ SEQ_REGISTRY = {
 }
 
 
+# --------------------------------------------------------------------------
+# Bounded log-scale for TarFlow's affine coupling
+# --------------------------------------------------------------------------
+
+def bound_log_scale(model, bound):
+    """Soft-bound the log-scale head of every TarFlow MetaBlock in `model`.
+
+    The official coupling is z = (x - xb) * exp(-xa) with xa the raw output of
+    a linear head applied to the un-normalised residual stream, so xa grows
+    linearly with the block's input magnitude and exp() turns a moderately
+    unusual token into an overflow that the next block amplifies further. This
+    replaces xa by  bound * tanh(xa / bound)  in BOTH directions, so a single
+    block can scale by at most exp(+-bound); everything else -- parameters,
+    state_dict keys, permutations, KV-cached sampling -- is untouched, and
+    for |xa| << bound the map is the official one to first order.
+
+    The official repository is not modified: the blocks are re-classed in place
+    to a subclass that only overrides `forward` and `reverse_step`.
+    """
+    base_cls = type(model.blocks[0])
+    if any(blk.class_embed is not None for blk in model.blocks):
+        raise NotImplementedError("bound_log_scale only supports unconditional models")
+    b = float(bound)
+
+    class BoundedMetaBlock(base_cls):
+        log_scale_bound = b
+
+        def _squash(self, xa):
+            return self.log_scale_bound * torch.tanh(xa / self.log_scale_bound)
+
+        def forward(self, x, y=None):
+            x = self.permutation(x)
+            pos_embed = self.permutation(self.pos_embed, dim=0)
+            x_in = x
+            x = self.proj_in(x) + pos_embed
+            if self.class_embed is not None:
+                x = x + (self.class_embed[y] if y is not None
+                         else self.class_embed.mean(dim=0))
+            for block in self.attn_blocks:
+                x = block(x, self.attn_mask)
+            x = self.proj_out(x)
+            x = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+            if self.nvp:
+                xa, xb = x.chunk(2, dim=-1)
+                xa = self._squash(xa)
+            else:
+                xb, xa = x, torch.zeros_like(x)
+            scale = (-xa.float()).exp().type(xa.dtype)
+            return self.permutation((x_in - xb) * scale, inverse=True), -xa.mean(dim=[1, 2])
+
+        def reverse_step(self, x, pos_embed, i, y=None, attn_temp=1.0, which_cache="cond"):
+            xa, xb = base_cls.reverse_step(self, x, pos_embed, i, y, attn_temp, which_cache)
+            return (self._squash(xa) if self.nvp else xa), xb
+
+    for blk in model.blocks:
+        blk.__class__ = BoundedMetaBlock
+    return model
+
+
+def condition_on_image(model, cond_channels, bound=None):
+    """Make every TarFlow MetaBlock in `model` conditional on an IMAGE.
+
+    The conditioning image has the same spatial size as the data (any number
+    of channels): it is patchified exactly like the image, embedded by its own
+    linear projection and positional table -- an extra input channel of the
+    coupling network -- and prepended to the token sequence as a PREFIX. Image
+    token i attends to every conditioning token and, causally, to image tokens
+    <= i; the output at the LAST conditioning token supplies the affine
+    parameters of image token 0 (the official model uses zeros there), and the
+    output at image token i those of token i+1, as in the official model. The
+    coupling itself, the permutations and the KV-cached sampling loop are the
+    official ones, so the map stays exactly invertible given the conditioning
+    image and its log-determinant is unchanged. Sampling first runs the prefix
+    through the cache (bidirectional over the prefix), then the official
+    one-token-at-a-time loop.
+
+    The model's `y` argument now carries the patchified conditioning image
+    (B, T, cond_channels * patch^2), so `Model.forward(x, y)` and
+    `Model.reverse(z, y)` are used unchanged. `bound` optionally applies the
+    same soft log-scale bound as bound_log_scale. The official repository is
+    not modified: blocks are re-classed in place and gain two parameters
+    (`cond_proj`, `cond_pos_embed`) and one buffer (`cond_attn_mask`).
+    """
+    base_cls = type(model.blocks[0])
+    if any(blk.class_embed is not None for blk in model.blocks):
+        raise NotImplementedError("condition_on_image: class embeddings are not combined")
+    b = float(bound) if bound else None
+
+    class CondMetaBlock(base_cls):
+        log_scale_bound = b
+
+        def _squash(self, xa):
+            if self.log_scale_bound is None:
+                return xa
+            return self.log_scale_bound * torch.tanh(xa / self.log_scale_bound)
+
+        def _split(self, h):
+            if self.nvp:
+                xa, xb = h.chunk(2, dim=-1)
+                return self._squash(xa), xb
+            return torch.zeros_like(h), h
+
+        def forward(self, x, y=None):
+            if y is None:
+                raise ValueError("conditional block needs the conditioning tokens as y")
+            x = self.permutation(x)
+            c = self.permutation(y)
+            pos_embed = self.permutation(self.pos_embed, dim=0)
+            cond_pos = self.permutation(self.cond_pos_embed, dim=0)
+            x_in, T = x, x.size(1)
+            h = torch.cat([self.cond_proj(c) + cond_pos, self.proj_in(x) + pos_embed], dim=1)
+            for block in self.attn_blocks:
+                h = block(h, self.cond_attn_mask)
+            h = self.proj_out(h)[:, T - 1:2 * T - 1]     # prefix end -> token 0, token i -> i+1
+            xa, xb = self._split(h)
+            scale = (-xa.float()).exp().type(xa.dtype)
+            return self.permutation((x_in - xb) * scale, inverse=True), -xa.mean(dim=[1, 2])
+
+        def reverse_step(self, x, pos_embed, i, y=None, attn_temp=1.0, which_cache="cond"):
+            xa, xb = base_cls.reverse_step(self, x, pos_embed, i, None, attn_temp, which_cache)
+            return (self._squash(xa) if self.nvp else xa), xb
+
+        def reverse(self, x, y=None, guidance=0, guide_what="ab", attn_temp=1.0,
+                    annealed_guidance=False):
+            if y is None or guidance:
+                raise ValueError("conditional reverse needs y and supports no guidance")
+            x = self.permutation(x)
+            c = self.permutation(y)
+            pos_embed = self.permutation(self.pos_embed, dim=0)
+            cond_pos = self.permutation(self.cond_pos_embed, dim=0)
+            self.set_sample_mode(True)
+            # prefix: all conditioning tokens at once, no mask, filling the KV cache
+            h = self.cond_proj(c) + cond_pos
+            for block in self.attn_blocks:
+                h = block(h, attn_temp=attn_temp, which_cache="cond")
+            za, zb = self._split(self.proj_out(h[:, -1:]))
+            x[:, 0] = x[:, 0] * za[:, 0].float().exp().type(za.dtype) + zb[:, 0]
+            for i in range(x.size(1) - 1):
+                za, zb = self.reverse_step(x, pos_embed, i, None, attn_temp, "cond")
+                x[:, i + 1] = x[:, i + 1] * za[:, 0].float().exp().type(za.dtype) + zb[:, 0]
+            self.set_sample_mode(False)
+            return self.permutation(x, inverse=True)
+
+    cond_dim = int(cond_channels) * model.patch_size ** 2
+    for blk in model.blocks:
+        T, C = blk.pos_embed.shape
+        dev = blk.pos_embed.device
+        blk.__class__ = CondMetaBlock
+        blk.cond_proj = nn.Linear(cond_dim, C).to(dev)
+        blk.cond_pos_embed = nn.Parameter(torch.randn(T, C, device=dev) * 1e-2)
+        mask = torch.zeros(2 * T, 2 * T, device=dev)
+        mask[:T, :T] = 1.0                                   # prefix: bidirectional
+        mask[T:, :T] = 1.0                                   # image tokens see the prefix
+        mask[T:, T:] = torch.tril(torch.ones(T, T, device=dev))   # and causally each other
+        blk.register_buffer("cond_attn_mask", mask)
+    return model
+
+
 # ==========================================================================
 # Family 2: InvertibleModule -- general invertible maps with logdet
 # ==========================================================================

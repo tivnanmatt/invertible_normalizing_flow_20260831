@@ -1,93 +1,48 @@
 #!/usr/bin/env python
-"""step7_system_bridge.py -- a TarFlow bridge from the pseudo-inverse to the image.
+"""step8_conditional_flow.py -- conditional TarFlow on the pseudo-inverse.
 
-The flow analogue of System-embedded Diffusion Bridge Models
-(Sobieski, Tivnan et al., arXiv:2506.23726). Instead of a time-indexed SDE whose
-coefficients embed the measurement system, we embed the SAME system into the
-BASE DENSITY of an exact-likelihood normalizing flow.
+The simple alternative to the system-embedded bridge of step 7. Nothing is
+embedded in the base density: the flow is an official TarFlow with the
+standard-normal base and the official bits/dim, and the measurement enters
+as an EXTRA INPUT CHANNEL of the coupling networks,
 
-Standard TarFlow trains  log p(x) = log N(f(x); 0, I) + log|det J_f|.
-Here, for a linear system y = A x + sigma*eps, we replace the standard normal by
-the system's own terminal distribution -- the SDB bridge endpoint at t=1:
+    log p(x | y) = log N( f(x; A^+y) ; 0, I ) + log|det J_f(.; A^+y)|,
 
-    log p(x|y) = log N( f(x) ; A^+y , Sigma_1 ) + log|det J_f|
-    Sigma_1    = gamma A^+ Sigma A^+T + beta (I - A^+A)
+where A^+y is the pseudo-inverse reconstruction of y = A x + sigma eps. The
+conditioning is therefore always image-shaped no matter what shape y has --
+a masked image, a thumbnail, or a sinogram: A is rectangular in general and y
+could not be concatenated to x, but A^+y can. Training is exact maximum
+likelihood on (x, y) pairs drawn fresh every step; a posterior sample is
+x = f^-1(z; A^+y) with z ~ N(0, I). There is no stiff base, no whitening,
+no closed-form target: the measurement noise lives in the conditioning input,
+where the network can learn to ignore it, not in the density's target.
 
-This is a proper conditional density in x for every fixed y (the change of
-variables integrates to 1), so it trains by exact maximum likelihood on paired
-(x, y) and reports an honest conditional bits/dim.
+HOW THE CONDITIONING ENTERS (invlib.condition_on_image). A^+y is patchified
+like the image, embedded by its own linear projection and positional table,
+and prepended to the token sequence as a prefix. Every image token attends to
+the whole prefix and, causally, to earlier image tokens; the output at the end
+of the prefix supplies the affine parameters of image token 0 (zeros in the
+official model) and the output at image token i those of token i+1, exactly
+as in the official model. Coupling, permutations, log-determinant and the
+KV-cached sampling loop are the official ones (the prefix is pushed through
+the cache first), so the map is exactly invertible for every conditioning
+image. The official repository is not modified: blocks are re-classed at
+runtime and gain one linear layer and one positional table each.
 
-f IS UNCONDITIONAL: the measurement enters only through the base's mean and
-covariance. With f = id the range residual x - A^+y is exactly -A^+n, whose
-law is the range block of Sigma_1 by construction, so training starts from a
-well-scaled point; on the null space f must Gaussianise the unmeasured content
-to N(0, beta), conditioned on the observed content through TarFlow's own
-autoregression. The identity is NOT the optimum on the range, though. For one
-coordinate with prior spread tau and base variance v, the best affine action
-z = m + a (x - m) has a (a - 1) = v / tau^2: the flow expands prior-dominated
-coordinates, and that expansion is how the prior enters the posterior. The
-resulting sample keeps residual measurement noise of order tau on each
-coordinate -- never more than the prior's own spread -- instead of the
-Bayes-optimal tau^2 / sqrt(v). So the family is exact in the low-noise regime
-(v << tau^2), mildly conservative where the prior dominates, and can only be
-made exact everywhere by conditioning f on A^+y (not done here).
-
-WHY THE FLOW ACTS IN V COORDINATES. TarFlow's coupling is elementwise within a
-token and never mixes channels, so for a fixed context the map on one patch is
-a per-pixel affine map. It can therefore only match a base that is DIAGONAL in
-the coordinates it sees. Sigma_1 is diagonal in the right-singular basis V of
-A, not in pixels: for average pooling the 16 pixels of a patch are strongly
-correlated under Sigma_1 (block mean pinned to the measurement, details white).
-Training in pixels produced a finite bpd but no usable samples for sr_4x. The
-flow is therefore applied to c = V^T x (orthogonal, logdet 0); for the
-pixel-diagonal systems (denoise, inpainting) this is the identity.
-
-WHY THE LOG-SCALE IS BOUNDED. The official coupling z = (x - xb) exp(-xa) has
-an unbounded head, applied to the un-normalised residual stream, so xa grows
-with the block's input magnitude. On one validation image in 4000 (inpaint_box)
-block 2 produced xa = -11.5, block 3 -- fed a 1e5-scale token -- produced
-xa = -9582, and the loss was inf; on sampled contexts (sr_4x, reverse pass) a
-head produced za = +154. invlib.bound_log_scale replaces xa by
-bound * tanh(xa / bound) in both directions; nothing else in the official model
-is changed, and in the operating regime |xa| < 4 the map is the official one to
-first order.
-
-WHY TRAINING USES THE EXPECTED TARGET. Redrawing y = Ax + sigma eps at every
-step scores f(x) against A^+y = A^+A x + sigma A^+ eps, a target the flow
-cannot predict, so the gradient carries a noise term of magnitude a sigma/v
-per range coordinate (a = gain, v = base variance). On the trained inpaint_box
-model that noise had RMS norm 19.4 against 22.5 for the true gradient: about
-half of every clipped step was noise, in a valley whose width in the shift is
-tau (the dequantization scale, 2e-3). The base is Gaussian, so the expectation
-over eps is exact in closed form: E log N(f(x); A^+y, Sigma_1) =
-log N(f(x); A^+A x, Sigma_1) - rank/(2 gamma). Training uses that (identical
-objective, zero target variance, `train_target: expected`); evaluation always
-scores real (x, y) pairs so the reported bpd is a conditional likelihood.
-The sampled target remains available for the ablations.
-
-WHY THERE IS A REWIND. With the bound in place, inpaint_random collapsed at
-epoch 24 (0 batches rejected before, 236/421 in that epoch) and sr_2x at epoch
-52 (7 before, 285/421) -- no warning in the validation curve either time. The
-destroyed weights had ordinary log-scales (|xa| < 4.1, nothing near the bound)
-but range residuals (f(x) - A^+y)_i / sqrt(v_i) of RMS ~10 against 1.4 for a
-healthy model: the shifts broke, not the scales -- the stiffness above. The
-state at the end of every healthy epoch is kept; a collapsed epoch (majority
-rejected, or validation a full bit above its best) is discarded, the state
-restored, the peak learning rate halved, and the epoch repeated, at most
-`max_rewinds` times. Each rewind is reported in the table. If the budget is
-exhausted the run is evaluated at its last healthy weights, labelled as such.
-
-Sampling  z ~ N(A^+y, Sigma_1),  x = f^-1(z)  is then a POSTERIOR SAMPLE: the
-range space follows the measurement (data consistency is measured, not
-enforced) and the null space is drawn from the learned prior conditioned on it.
+The reported number is the conditional bits/dim of the test images given
+their (freshly drawn) measurement, directly comparable with the unconditional
+MNIST numbers of steps 4-6 (a conditional density can only be sharper) and
+with the conditional bits/dim of step 7. Data consistency, PSNR of A^+y, of
+one posterior sample and of the posterior mean, and failure counts are
+reported as in step 7 so the two approaches share one table format.
 
 Usage:
-  python step7_system_bridge.py [--systems inpaint_box sr_2x] [--profile reduced]
-  python step7_system_bridge.py --collect
+  python step8_conditional_flow.py [--systems ct_sparse sr_4x] [--profile reduced]
+  python step8_conditional_flow.py --verify-only      # invertibility + logdet checks
+  python step8_conditional_flow.py --collect
 """
 
 import argparse
-import contextlib
 import copy
 import csv
 import json
@@ -107,20 +62,17 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "step7_system_bridge.yml"
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "step8_conditional_flow.yml"
 
 import invlib  # noqa: E402
 import measlib  # noqa: E402
 import step1_datasets  # noqa: E402
 import step2_tarflow as s2  # noqa: E402
 from step4_tarflow_ablation import PadTo  # noqa: E402
+from step7_system_bridge import FAIL_BPD, _psnr, _tex, bpd_stats, isolated_rng  # noqa: E402
 
-LOG_K = math.log(128.0)   # official [-1,1] 8-bit dequantization constant
-# An image whose conditional bpd exceeds this has effectively been rejected by
-# the model (uniform noise on [-1,1] costs 8 bits/dim). Such images are counted
-# and reported separately so that one of them cannot silently turn a mean over
-# 10000 images into inf, and so that their number is a visible result.
-FAIL_BPD = 50.0
+# Keys of a `systems:` entry that configure the run rather than the operator.
+RUN_KEYS = ("noise_type", "noise_std", "scale_bound", "max_rewinds")
 
 
 def load_config(path=DEFAULT_CONFIG):
@@ -147,13 +99,6 @@ def make_loaders(cfg, bud, device):
     return train, val, test
 
 
-# Keys of a `systems:` entry that configure the RUN rather than the operator.
-# Each overrides the top-level value of the same name, so one system can be an
-# ablation (e.g. Gaussian input noise with the official unbounded head) while
-# the others keep the defaults.
-RUN_KEYS = ("noise_type", "noise_std", "scale_bound", "train_target", "max_rewinds")
-
-
 def build_system(cfg, sys_name, device):
     sc = {k: v for k, v in cfg["systems"][sys_name].items() if k not in RUN_KEYS}
     kind = sc.pop("kind")
@@ -164,85 +109,55 @@ def build_system(cfg, sys_name, device):
 
 
 def run_opts(cfg, sys_name):
-    """Effective input noise, log-scale bound, training target and rewind budget."""
     sc = cfg["systems"][sys_name]
     get = lambda k, d=None: sc.get(k, cfg.get(k, d))  # noqa: E731
     noise = {"noise_type": get("noise_type", "uniform")}
     if noise["noise_type"] == "gaussian":
         noise["noise_std"] = float(get("noise_std"))
-    target = get("train_target", "sampled")
-    assert target in ("sampled", "expected"), target
     return dict(noise=noise, scale_bound=get("scale_bound") or None,
-                train_target=target, max_rewinds=int(get("max_rewinds", 0)))
+                max_rewinds=int(get("max_rewinds", 0)))
 
 
-def cond_bpd_terms(model, op, x, target="sampled"):
-    """log p(x|y) per dim in nats, plus the pinv recon and the two components.
+def build_model(cfg, tf, device, scale_bound=None):
+    mc = cfg["model"]
+    model = tf.Model(in_channels=cfg["channel_size"], img_size=cfg["img_size"],
+                     patch_size=cfg["patch_size"], channels=mc["channels"],
+                     num_blocks=mc["blocks"], layers_per_block=mc["layers_per_block"],
+                     nvp=True, num_classes=0).to(device)
+    invlib.condition_on_image(model, cfg["channel_size"], bound=scale_bound)
+    return model
 
-    The flow acts on c = V^T x (see module docstring); the base is diagonal
-    there. The components are returned separately because they fail
-    differently: the base term is a stiff quadratic, the logdet term diverges
-    when the flow's scales collapse. Logging both localises any blow-up.
 
-    target="sampled"  draws y = Ax + sigma eps and scores against A^+y: the
-                      actual conditional log-likelihood of one (x, y) pair.
-                      Evaluation always uses this.
-    target="expected" scores against A^+A x and subtracts the closed-form
-                      expectation of the noise term. Because the base is
-                      Gaussian, E_eps log N(f(x); A^+y, Sigma_1) equals
-                      log N(f(x); A^+A x, Sigma_1) - rank / (2 gamma) exactly,
-                      so this is the SAME objective with the target noise
-                      integrated out. Used for training only (see docstring).
+def n_meas(op):
+    """Number of scalar measurements: rows of A (rank for the implicit systems)."""
+    return getattr(op, "n_meas", int((op.sing() > 0).sum()))
+
+
+def cond_bpd_terms(model, op, x, xhat=None):
+    """log p(x | A^+y) per dim in nats, with the official base and constant.
+
+    A fresh measurement is drawn unless `xhat` is given, so training scores
+    each image against a new noise realisation every step (exact conditional
+    maximum likelihood) and evaluation scores real (x, y) pairs.
     """
-    if target == "expected":
-        xhat = op.project(x)
-        s = op.sing(x.device, x.dtype)
-        const = 0.5 * float((s > 0).sum()) / op.gamma
-    else:
-        xhat, const = op.pinv_recon(x), 0.0
-    z_tok, _, logdets = model(op.basis_fwd(x), None)
+    if xhat is None:
+        xhat = op.pinv_recon(x)
+    z, _, logdets = model(x, model.patchify(xhat))
     D = float(np.prod(x.shape[1:]))
-    lp_base = (op.coef_logprob(model.unpatchify(z_tok), op.basis_fwd(xhat)) - const) / D - LOG_K
+    lp_base = s2.gaussian_log_prob(z) / D         # includes the -log 128 term
     return lp_base + logdets, xhat, lp_base, logdets
 
 
 @torch.no_grad()
 def posterior_sample(model, op, xhat, generator=None):
-    """x = f^-1(z), z ~ N(A^+y, Sigma_1), returned in pixel space."""
-    cz = op.coef_sample_base(op.basis_fwd(xhat), generator)
-    return op.basis_inv(model.reverse(model.patchify(cz)))
-
-
-@contextlib.contextmanager
-def isolated_rng(device, seed):
-    """Fixed-seed RNG for evaluation that does not disturb the training stream.
-
-    Reseeding the global generator inside the epoch loop would restart the
-    dequantization and measurement-noise sequence at every epoch.
-    """
-    devs = [torch.device(device).index] if torch.device(device).type == "cuda" else []
-    with torch.random.fork_rng(devices=devs):
-        torch.manual_seed(seed)
-        yield
-
-
-def bpd_stats(bpd):
-    """Summary of per-image conditional bits/dim that survives a few failures.
-
-    `mean` is over every image (inf if any image is inf) -- the honest number;
-    `mean_ok` excludes the `n_fail` images above FAIL_BPD or non-finite.
-    """
-    bad = ~torch.isfinite(bpd) | (bpd > FAIL_BPD)
-    ok = bpd[~bad]
-    return dict(mean=bpd.mean().item(),
-                median=bpd.nanmedian().item(),
-                mean_ok=ok.mean().item() if ok.numel() else float("nan"),
-                n_fail=int(bad.sum()), n=int(bpd.numel()))
+    """x = f^-1(z; A^+y), z ~ N(0, I)."""
+    c = model.patchify(xhat)
+    z = torch.randn(c.shape, device=c.device, dtype=c.dtype, generator=generator)
+    return model.reverse(z, c)
 
 
 @torch.no_grad()
 def eval_bpd(model, op, loader, device, seed=0, noise=None):
-    """Conditional bits/dim only -- no sampling, cheap enough to run each epoch."""
     model.eval()
     noise = noise or {"noise_type": "uniform"}
     vals = []
@@ -257,14 +172,8 @@ def eval_bpd(model, op, loader, device, seed=0, noise=None):
 
 @torch.no_grad()
 def evaluate(model, op, loader, device, seed=0, n_post=4, n_sample_img=64, noise=None):
-    """Full metrics: conditional bpd, PSNR, and DATA CONSISTENCY.
-
-    Data consistency asks whether f^-1 actually respects the measurement: the
-    range-space component of a posterior sample should reproduce A^+y. Nothing
-    enforces this architecturally, so it is an empirical check of the central
-    claim, not a given. Sampling is autoregressive and slow, so PSNR and data
-    consistency use the first `n_sample_img` images only.
-    """
+    """Conditional bpd on the whole loader; PSNR and data consistency on the
+    first `n_sample_img` images (autoregressive sampling is the slow part)."""
     model.eval()
     noise = noise or {"noise_type": "uniform"}
     vals, psnr, dc = [], dict(pinv=[], sample=[], post_mean=[]), []
@@ -278,8 +187,6 @@ def evaluate(model, op, loader, device, seed=0, n_post=4, n_sample_img=64, noise
                 k = min(n_sample_img - m, x.size(0))
                 xs, xh = x[:k], xhat[:k]
                 recs = [posterior_sample(model, op, xh) for _ in range(n_post)]
-                # a non-finite sample is a failure of the inverse map: count it
-                # and keep it out of the averages rather than letting it poison them
                 ok = torch.stack([torch.isfinite(r.flatten(1)).all(1) for r in recs]).all(0)
                 n_bad += int((~ok).sum())
                 recs = [r.clamp(-1, 1) for r in recs]
@@ -287,7 +194,6 @@ def evaluate(model, op, loader, device, seed=0, n_post=4, n_sample_img=64, noise
                 psnr["pinv"].append(_psnr(xh, xs)[ok])
                 psnr["sample"].append(_psnr(pr, xs)[ok])
                 psnr["post_mean"].append(_psnr(pm, xs)[ok])
-                # relative range-space disagreement between sample and measurement
                 num = (op.project(pr) - op.project(xh)).flatten(1).norm(dim=-1)
                 den = op.project(xh).flatten(1).norm(dim=-1).clamp_min(1e-8)
                 dc.append((num / den)[ok])
@@ -304,38 +210,18 @@ def evaluate(model, op, loader, device, seed=0, n_post=4, n_sample_img=64, noise
                 n_sample_img=m, n_bad_samples=n_bad)
 
 
-def _psnr(a, b):
-    """Per-image PSNR on the [0,1] scale."""
-    a01, b01 = (a.clamp(-1, 1) + 1) / 2, (b.clamp(-1, 1) + 1) / 2
-    mse = ((a01 - b01) ** 2).flatten(1).mean(-1).clamp_min(1e-12)
-    return 10 * torch.log10(1.0 / mse)
-
-
 def run_system(sys_name, cfg, bud, device, out_data, out_figs):
-    transformer_flow = s2.import_tarflow(cfg)
+    tf = s2.import_tarflow(cfg)
     torch.manual_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
 
     op = build_system(cfg, sys_name, device)
     opts = run_opts(cfg, sys_name)
-    noise, scale_bound = opts["noise"], opts["scale_bound"]
-    target, max_rewinds = opts["train_target"], opts["max_rewinds"]
-    print(f"[{sys_name}] system: {op} | input noise {noise} | scale bound {scale_bound} | "
-          f"train target {target} | max rewinds {max_rewinds}", flush=True)
+    noise, scale_bound, max_rewinds = opts["noise"], opts["scale_bound"], opts["max_rewinds"]
+    print(f"[{sys_name}] system: {op} | measurements {n_meas(op)} | input noise {noise} | "
+          f"scale bound {scale_bound} | max rewinds {max_rewinds}", flush=True)
 
-    mc = cfg["model"]
-    model = transformer_flow.Model(
-        in_channels=cfg["channel_size"], img_size=cfg["img_size"],
-        patch_size=cfg["patch_size"], channels=mc["channels"],
-        num_blocks=mc["blocks"], layers_per_block=mc["layers_per_block"],
-        nvp=True, num_classes=0).to(device)
-    # model.reverse() rescales the latent by model.var; we supply our own base
-    # covariance, so var must stay at its identity init (update_prior unused).
-    assert torch.allclose(model.var, torch.ones_like(model.var)), \
-        "model.var must be identity: the base covariance is Sigma_1, not var"
-    if scale_bound:
-        invlib.bound_log_scale(model, scale_bound)
-
+    model = build_model(cfg, tf, device, scale_bound)
     train_loader, val_loader, test_loader = make_loaders(cfg, bud, device)
     optimizer = torch.optim.AdamW(model.parameters(), betas=(0.9, 0.95),
                                   lr=bud["lr"], weight_decay=1e-4)
@@ -357,17 +243,11 @@ def run_system(sys_name, cfg, bud, device, out_data, out_figs):
         csv.writer(f).writerow(["epoch", "train_bpd", "val_bpd", "val_bpd_ok", "val_n_fail",
                                 "base_bpd", "logdet_bpd", "n_skipped", "epoch_seconds",
                                 "rewinds"])
-    n_skipped, aborted = 0, None
-    loss_ema = None
+    n_skipped, aborted, loss_ema = 0, None, None
     reject_mult = float(cfg.get("loss_reject_mult", 5.0))
-    reject_abs = float(cfg.get("loss_reject_abs", 5.0))   # nats/dim
-    # Rewind-on-collapse. Training collapsed without warning at epoch 24
-    # (inpaint_random) and 52 (sr_2x): zero or a handful of rejected batches,
-    # a falling validation curve, then a majority of one epoch rejected and
-    # the weights gone. The state at the end of every healthy epoch is kept
-    # (model + optimizer, ~20 MB); a collapsed epoch is discarded, that state
-    # restored, the peak learning rate halved, and the epoch repeated. Every
-    # rewind is counted and reported; a run with 0 rewinds is unaffected.
+    reject_abs = float(cfg.get("loss_reject_abs", 5.0))
+    # Same safeguards as step 7 (batch rejection, rewind-on-collapse); every
+    # rejected batch and every rewind is counted and reported.
     healthy, n_rewinds, lr_scale, best_ok, rewind_log = None, 0, 1.0, float("inf"), []
     epoch = 0
     while epoch < bud["epochs"]:
@@ -379,14 +259,8 @@ def run_system(sys_name, cfg, bud, device, out_data, out_figs):
             for pg in optimizer.param_groups:
                 pg["lr"] = lr_at(step, lr_scale)
             optimizer.zero_grad()
-            lp, _, lp_base, ld = cond_bpd_terms(model, op, x, target)
-            loss = -lp.mean()                       # nats/dim
-            # Reject non-finite AND finite-but-absurd batches, counting both.
-            # Before the log-scale bound, the denoise run's base term sat at
-            # 7.37 bits for 25 epochs and then one batch hit 9.2e24 -- finite,
-            # so it passed an isfinite check, and its clipped gradient still
-            # destroyed the weights. A run with n_skipped_steps = 0 is
-            # unaffected by this rule.
+            lp, _, lp_base, ld = cond_bpd_terms(model, op, x)
+            loss = -lp.mean()
             lv = loss.item()
             reject = (not math.isfinite(lv)) or (
                 loss_ema is not None and lv > reject_mult * loss_ema + reject_abs)
@@ -406,17 +280,10 @@ def run_system(sys_name, cfg, bud, device, out_data, out_figs):
                 continue
             optimizer.step()
             loss_ema = lv if loss_ema is None else 0.99 * loss_ema + 0.01 * lv
-            tot += lv / math.log(2)                 # report in bits/dim
+            tot += lv / math.log(2)
             acc_base += (-lp_base.mean().item()) / math.log(2)
             acc_ld += (-ld.mean().item()) / math.log(2)
             nb += 1
-        # Collapse = a majority of the epoch's batches rejected (the weights are
-        # gone and the rejection rule now blocks every update), or the robust
-        # validation mean jumping a full bit above its best (a slow-drift
-        # collapse the rejection rule cannot see). A non-finite validation
-        # MEAN is neither: it is a property of a few images (the first
-        # inpaint_box run was killed at epoch 66 by 1 image in 4000 while its
-        # training loss was still improving) and is recorded, never acted on.
         collapse = None
         if nskip_epoch > (nb + nskip_epoch) // 2:
             collapse = f"{nskip_epoch}/{nb + nskip_epoch} batches rejected at epoch {epoch+1}"
@@ -448,7 +315,7 @@ def run_system(sys_name, cfg, bud, device, out_data, out_figs):
                    f"{healthy['epoch']} weights restored, peak lr x{lr_scale:g}")
             rewind_log.append(msg)
             print(f"[{sys_name}] {msg}", flush=True)
-            epoch = healthy["epoch"]        # repeat the collapsed epoch
+            epoch = healthy["epoch"]
             continue
         best_ok = min(best_ok, vs["mean_ok"])
         healthy = dict(model=copy.deepcopy(model.state_dict()),
@@ -461,19 +328,18 @@ def run_system(sys_name, cfg, bud, device, out_data, out_figs):
               f"logdet {acc_ld/nb:.3f} skip {n_skipped}] ({dt:.0f}s)", flush=True)
         epoch += 1
 
-    if not curve:                       # aborted before any epoch completed
+    if not curve:
         curve.append((0, float("nan")))
     ev = evaluate(model, op, test_loader, device, seed=cfg["seed"], noise=noise)
     tb = ev["bpd"]
     result = {
         "name": sys_name, "system": repr(op),
         "kind": cfg["systems"][sys_name]["kind"],
-        "sigma": op.sigma, "gamma": op.gamma, "beta": op.beta,
+        "sigma": op.sigma, "n_meas": n_meas(op),
         "rank": int((op.sing() > 0).sum()), "n_null": op.n_null(),
-        "logdet_sigma": op.logdet_sigma(),
         "scale_bound": scale_bound, "input_noise": noise,
-        "train_target": target, "max_rewinds": max_rewinds,
-        "n_rewinds": n_rewinds, "rewind_log": rewind_log, "lr_scale_final": lr_scale,
+        "max_rewinds": max_rewinds, "n_rewinds": n_rewinds, "rewind_log": rewind_log,
+        "lr_scale_final": lr_scale,
         "val_bpd_curve": curve, "final_val_bpd": curve[-1][1],
         "test_cond_bpd": tb["mean_ok"], "test_cond_bpd_all": tb["mean"],
         "test_cond_bpd_median": tb["median"], "test_n_fail": tb["n_fail"],
@@ -506,7 +372,8 @@ def run_system(sys_name, cfg, bud, device, out_data, out_figs):
 
 @torch.no_grad()
 def _figure(model, op, loader, device, cfg, sys_name, out_figs, noise=None):
-    """Rows: ground truth | pseudo-inverse | 3 posterior samples | posterior mean."""
+    """Rows: ground truth | A^+y | 3 posterior samples | posterior mean; and,
+    for a system whose measurement is not an image, the measurements too."""
     model.eval()
     x, _ = next(iter(loader))
     k = min(8, x.size(0))
@@ -515,18 +382,27 @@ def _figure(model, op, loader, device, cfg, sys_name, out_figs, noise=None):
         xhat = op.pinv_recon(x)
         samples = [posterior_sample(model, op, xhat).nan_to_num(0.0).clamp(-1, 1)
                    for _ in range(8)]
+        y = op.measure(x) if hasattr(op, "n_angles") else None
     rows = [x, xhat.clamp(-1, 1)] + samples[:3] + [torch.stack(samples).mean(0)]
     labels = ["truth", "pinv A+y", "post 1", "post 2", "post 3", "post mean"]
-    grid = torch.cat(rows, 0)
-    tv.utils.save_image(grid, out_figs / f"{sys_name}_posterior.png",
+    tv.utils.save_image(torch.cat(rows, 0), out_figs / f"{sys_name}_posterior.png",
                         normalize=True, value_range=(-1, 1), nrow=k)
     with open(out_figs / f"{sys_name}_posterior_rows.txt", "w") as f:
         f.write("\n".join(f"row {i}: {l}" for i, l in enumerate(labels)) + "\n")
+    if y is not None:
+        # the measurement itself, in its own shape (e.g. a sinogram: views x bins)
+        y = y.reshape(k, op.n_angles, op.n_det).cpu()
+        fig, axes = plt.subplots(1, k, figsize=(1.6 * k, 1.6))
+        for i, ax in enumerate(axes):
+            ax.imshow(y[i], cmap="gray", aspect="auto")
+            ax.set_xticks([]), ax.set_yticks([])
+        axes[0].set_ylabel(f"{op.n_angles} views")
+        fig.suptitle(f"{sys_name}: measured sinograms ({op.n_angles} x {op.n_det}), sigma={op.sigma}",
+                     fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_figs / f"{sys_name}_measurements.png", dpi=120)
+        plt.close(fig)
     model.train()
-
-
-def _tex(s):
-    return (str(s).replace("_", r"\_").replace("%", r"\%").replace("&", r"\&"))
 
 
 def collect(cfg, out_data, out_figs):
@@ -539,26 +415,23 @@ def collect(cfg, out_data, out_figs):
         print("nothing to collect")
         return results
     results.sort(key=lambda r: r["test_cond_bpd"])
-    lines = [r"\begin{tabular}{llrrrrrrrr}", r"\hline",
-             r"system & kind & null dims & cond bpd & fail & rewinds & PSNR $A^+y$ & "
+    lines = [r"\begin{tabular}{llrrrrrrrrr}", r"\hline",
+             r"system & kind & meas & null dims & cond bpd & fail & rewinds & PSNR $A^+y$ & "
              r"PSNR sample & PSNR post-mean & DC err \\", r"\hline"]
     for r in results:
         n_fail, n = r.get("test_n_fail", 0), r.get("test_n", 0)
         n_bad, n_img = r.get("n_bad_samples", 0), r.get("n_sample_img", 0)
-        # an ablation is visible in the table by its deviations from the defaults
         kind = r["kind"]
         noise = r.get("input_noise", {"noise_type": "uniform"})
         if noise.get("noise_type") == "gaussian":
             kind += f", gauss {noise['noise_std']:g}"
         if not r.get("scale_bound"):
             kind += ", unbounded"
-        if r.get("train_target", "sampled") == "sampled":
-            kind += ", sampled target"
         rw = f"{r.get('n_rewinds', 0)}/{r.get('max_rewinds', 0)}"
         if r.get("aborted"):
             rw += " abort"
         lines.append(
-            f"{_tex(r['name'])} & {_tex(kind)} & {r['n_null']} & "
+            f"{_tex(r['name'])} & {_tex(kind)} & {r['n_meas']} & {r['n_null']} & "
             f"{r['test_cond_bpd']:.4f} & {n_fail}/{n} & {rw} & {r['psnr_pinv']:.2f} & "
             f"{r['psnr_sample']:.2f} & {r['psnr_post_mean']:.2f} & "
             f"{r.get('data_consistency_rel_err', float('nan')):.4f} "
@@ -566,18 +439,100 @@ def collect(cfg, out_data, out_figs):
     lines += [r"\hline", r"\end{tabular}"]
     (out_data / "ranking_table.tex").write_text("\n".join(lines) + "\n")
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    # left: the whole run; right: the second half, where the curves separate
+    fig, (ax, axz) = plt.subplots(1, 2, figsize=(11, 4.6), gridspec_kw={"width_ratios": [3, 2]})
     for r in results:
         ep, bpd = zip(*r["val_bpd_curve"])
-        ax.plot(ep, bpd, label=f"{r['name']} ({r['test_cond_bpd']:.3f})")
+        (line,) = ax.plot(ep, bpd, label=f"{r['name']} ({r['test_cond_bpd']:.3f})")
+        half = [(e, b) for e, b in zip(ep, bpd) if e > len(ep) // 2]
+        axz.plot(*zip(*half), color=line.get_color())
+    # the unconditional value of the same model/budget (step 4 baseline_flip):
+    # a conditional density can only be sharper, so every curve should end
+    # below this line
+    uncond = REPO_ROOT / "outputs" / "step4_tarflow_ablation" / "data" / "baseline_flip_result.json"
+    if uncond.exists():
+        u = json.load(open(uncond)).get("test_bpd")
+        if u is not None:
+            ax.axhline(u, color="k", ls="--", lw=1, label=f"unconditional, step 4 ({u:.3f})")
+            axz.axhline(u, color="k", ls="--", lw=1)
     ax.set_xlabel("epoch")
     ax.set_ylabel("conditional bits/dim")
-    ax.set_title("System-embedded flow bridge: conditional bpd")
+    ax.set_title("Conditional TarFlow on $A^+y$: validation bits/dim")
     ax.legend(fontsize=8)
+    axz.set_xlabel("epoch")
+    axz.set_title("second half", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_figs / "bpd_overlay.png", dpi=120)
     plt.close(fig)
     return results
+
+
+def verify(cfg, verbose=True):
+    """Checks that the conditioned model is what it claims to be.
+
+    (1) exact inversion given the conditioning image, (2) the reported
+    log-determinant against the autograd Jacobian, (3) z depends on the
+    conditioning image, (4) the autoregressive structure is intact in a
+    single block: z token i does not depend on image tokens > i, and does
+    depend on every conditioning token.
+    """
+    tf = s2.import_tarflow(cfg)
+    torch.manual_seed(0)
+    img, patch, C = 8, 4, 1
+    ok = True
+
+    def small(blocks, bound=None):
+        m = tf.Model(in_channels=C, img_size=img, patch_size=patch, channels=64,
+                     num_blocks=blocks, layers_per_block=1, nvp=True, num_classes=0)
+        invlib.condition_on_image(m, C, bound=bound)
+        for name, p in m.named_parameters():   # non-trivial couplings (proj_out is zero-init)
+            p.data.add_((0.02 if "proj_out" in name else 0.1) * torch.randn_like(p))
+        return m.eval()      # float32: the official LayerNorm casts to float
+
+    x = torch.randn(3, C, img, img)
+    cimg = torch.randn(3, C, img, img)
+    for blocks, bound in ((2, None), (2, 8.0), (1, None)):
+        m = small(blocks, bound)
+        c = m.patchify(cimg)
+        z, _, ld = m(x, c)
+        xr = m.reverse(z, c)
+        inv_err = (xr - x).abs().max().item()
+
+        D = C * img * img
+        jac_err = 0.0
+        for b in range(x.size(0)):
+            f = lambda v: m(v.reshape(1, C, img, img), c[b:b + 1])[0].flatten()  # noqa: E731
+            J = torch.autograd.functional.jacobian(f, x[b].flatten())
+            ld_true = torch.linalg.slogdet(J)[1] / D
+            jac_err = max(jac_err, abs(ld_true.item() - ld[b].item()))
+
+        z2, _, _ = m(x, m.patchify(cimg + 0.5))
+        cond_dep = (z2 - z).abs().max().item()
+
+        ar_ok = True
+        if blocks == 1:                   # identity permutation: token order = sequence order
+            T = z.size(1)
+            for j in range(T):
+                xt = m.patchify(x).clone()
+                xt[:, j] += 1.0
+                zt, _, _ = m(m.unpatchify(xt), c)
+                d = (zt - z).abs().amax(dim=(0, 2))
+                ar_ok &= bool((d[:j] < 1e-12).all()) and bool(d[j] > 1e-6)
+            for j in range(T):
+                ct = c.clone()
+                ct[:, j] += 1.0
+                zt, _, _ = m(x, ct)
+                d = (zt - z).abs().amax(dim=(0, 2))
+                ar_ok &= bool((d > 1e-6).all())    # every image token sees every cond token
+        this = inv_err < 1e-4 and jac_err < 1e-4 and cond_dep > 1e-3 and ar_ok
+        ok &= this
+        if verbose:
+            print(f"blocks {blocks} bound {bound}: inversion {inv_err:.1e} | logdet vs jacobian "
+                  f"{jac_err:.1e} | cond dependence {cond_dep:.2e} | AR structure "
+                  f"{'ok' if ar_ok else 'BROKEN'} | {'OK' if this else 'FAIL'}")
+    if verbose:
+        print("conditional TarFlow verified:", ok)
+    return ok
 
 
 def main():
@@ -603,6 +558,9 @@ def main():
     print("measurement-system self-tests:")
     if not all(measlib.self_test().values()):
         raise SystemExit("measlib self-test FAILED -- refusing to train")
+    print("conditional-flow checks:")
+    if not verify(cfg):
+        raise SystemExit("conditional flow verification FAILED -- refusing to train")
     if args.verify_only:
         return
 
@@ -610,11 +568,11 @@ def main():
     profile = args.profile or ("full" if device != "cpu" else "reduced")
     bud = cfg["budget"][profile]
     names = args.systems or list(cfg["systems"])
-    print(f"step7: {len(names)} systems, profile={profile}, device={device}", flush=True)
+    print(f"step8: {len(names)} systems, profile={profile}, device={device}", flush=True)
 
     with open(out_data / "provenance.json", "w") as f:
-        json.dump(dict(step="step7_system_bridge", config=cfg, profile=profile,
-                       device=device,
+        json.dump(dict(step="step8_conditional_flow", config=cfg, profile=profile,
+                       device=device, tarflow_commit=s2.tarflow_commit(cfg),
                        started=datetime.now(timezone.utc).isoformat()), f, indent=2)
 
     for name in names:

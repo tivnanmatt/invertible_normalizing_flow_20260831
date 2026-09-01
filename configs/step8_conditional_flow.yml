@@ -1,0 +1,99 @@
+# Config for step8_conditional_flow.py -- conditional TarFlow on A^+y.
+#
+# The flow models p(x | A^+y) directly: an official TarFlow (standard normal
+# base, official bits/dim) whose coupling networks receive the pseudo-inverse
+# reconstruction A^+y as an extra, image-shaped input. Because A^+y always has
+# the image's shape, the measurement y itself can be anything -- a masked
+# image, a thumbnail, a sinogram -- so A may be rectangular.
+#
+# sigma > 0 for every system (a measurement always has noise; measlib requires
+# it). gamma/beta play no role here: the base density is N(0, I).
+
+seed: 20260901
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step8_conditional_flow
+
+dataset: mnist
+img_size: 32
+channel_size: 1
+patch_size: 4        # T = 64 tokens, same protocol as steps 4-7
+noise_type: uniform  # uniform dequantization, so bpd is a data likelihood
+grad_clip: 1.0
+# Batch-rejection rule from step 7 (loss > mult * ema + abs, nats/dim); with
+# the standard-normal base it is expected to fire rarely if ever, and the
+# count is reported.
+loss_reject_mult: 5.0
+loss_reject_abs: 5.0
+# Coupling log-scale soft bound (invlib.bound_log_scale semantics, applied in
+# both directions; 0 = the official unbounded head). Not needed for the
+# likelihood -- the base is N(0, I) -- but a barely-trained or extrapolating
+# head can still overflow in the SAMPLING direction (z off the data manifold
+# -> exp(za) chained over 4 blocks -> inf); the bound keeps every sample
+# finite at no cost in the operating regime |xa| < 4. One ablation below
+# runs the official unbounded head so the effect is measured, not assumed.
+scale_bound: 8.0
+# Rewind-on-collapse as in step 7 (restore last healthy epoch, halve peak lr,
+# repeat); reported per system, 0 disables.
+max_rewinds: 2
+
+model:               # identical to steps 4-7 so numbers stay comparable
+  channels: 128
+  blocks: 4
+  layers_per_block: 2
+
+budget:
+  full:
+    epochs: 120
+    train_subset: 0
+    val_subset: 4000
+    test_subset: 10000
+    batch: 128
+    lr: 1.0e-3
+  reduced:
+    epochs: 6
+    train_subset: 12000
+    val_subset: 2000
+    test_subset: 4000
+    batch: 128
+    lr: 1.0e-3
+
+# Each entry is one known linear measurement system (measlib.REGISTRY `kind`
+# plus its constructor arguments). The CT system is new -- its measurement is
+# an 8 x 45 sinogram, not an image -- and runs first; the other five are the
+# step-7 systems with the same parameters, so the two approaches are directly
+# comparable. Run-level keys (scale_bound, noise_type, max_rewinds) may be
+# overridden per system for ablations.
+systems:
+  ct_sparse:                   # 8-view parallel-beam CT: y is (8, 47), A is
+    kind: ct                   # 376 x 1024; truncated pseudo-inverse rank 290
+    sigma: 0.5                 # in sinogram units (ray sums are O(30))
+    n_angles: 8
+    rcond: 1.0e-2
+
+  sr_4x:
+    kind: sr_4x
+    sigma: 0.05
+
+  inpaint_box:
+    kind: inpaint_box
+    sigma: 0.05
+    box: 12
+
+  inpaint_random:
+    kind: inpaint_random
+    sigma: 0.05
+    drop: 0.5
+    seed: 0
+
+  sr_2x:
+    kind: sr_2x
+    sigma: 0.05
+
+  denoise:
+    kind: denoise
+    sigma: 0.2
+
+  sr_4x_unbounded:             # ablation: the official unbounded head
+    kind: sr_4x
+    sigma: 0.05
+    scale_bound: 0

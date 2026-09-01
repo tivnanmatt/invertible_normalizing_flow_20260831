@@ -312,9 +312,92 @@ class DCT2DFeatures(FeatureDomain2D):
         return torch.tensor(sorted(range(n * n), key=lambda k: keys[k]), dtype=torch.long)
 
 
+class HaarPyramid2D(SeqTransform):
+    """Depth-L Mallat 2D Haar pyramid in the STANDARD subband layout, applied
+    to the folded image and handed straight back to patchify.
+
+    Unlike Haar2DFeatures (which applies the full-depth tensor-product Haar
+    and then reorders all N*N coefficients coarse-to-fine), this recurses only
+    on the LL band L times and keeps the classical quadrant layout. With
+    L = log2(patch_size) + 1 chosen so that N >> L == patch_size, the LL_L
+    band exactly fills the top-left patch, so after patchify **token 0 is a
+    patch_size x patch_size thumbnail of the whole image** -- i.e. an
+    orthonormal rescaling of average-pooling the image down to one patch --
+    and later tokens carry progressively finer detail bands. No coefficient
+    reordering is needed: the subband layout already delivers coarse-to-fine
+    at patch granularity.
+
+    Each level is the orthonormal Haar step
+    LL,HL,LH,HH = (a+b+c+d)/2, (a-b+c-d)/2, (a+b-c-d)/2, (a-b-c+d)/2,
+    so the map is orthogonal (Q Q^T = I, |det| = 1, logdet 0) and the N(0,I)
+    prior and TarFlow likelihood accounting are untouched.
+    """
+
+    def __init__(self, img_size: int, patch_size: int, channels: int = 1,
+                 levels: int | None = None):
+        T = (img_size // patch_size) ** 2
+        super().__init__(T)
+        self.N, self.p, self.ch = img_size, patch_size, channels
+        if levels is None:                      # take LL down to exactly one patch
+            levels = int(round(math.log2(img_size // patch_size)))
+        assert img_size % (1 << levels) == 0, "img_size must be divisible by 2**levels"
+        self.levels = levels
+
+    @staticmethod
+    def _dwt(x, levels):
+        x = x.clone()
+        N = x.shape[-1]
+        for l in range(levels):
+            n = N >> l
+            s = x[..., :n, :n]
+            a, b = s[..., 0::2, 0::2], s[..., 0::2, 1::2]
+            c, d = s[..., 1::2, 0::2], s[..., 1::2, 1::2]
+            x[..., :n, :n] = torch.cat(
+                [torch.cat([(a + b + c + d) / 2, (a - b + c - d) / 2], -1),
+                 torch.cat([(a + b - c - d) / 2, (a - b - c + d) / 2], -1)], -2)
+        return x
+
+    @staticmethod
+    def _idwt(y, levels):
+        y = y.clone()
+        N = y.shape[-1]
+        for l in reversed(range(levels)):
+            n = N >> l
+            h = n // 2
+            q = y[..., :n, :n]
+            LL, HL = q[..., :h, :h], q[..., :h, h:]
+            LH, HH = q[..., h:, :h], q[..., h:, h:]
+            s = torch.zeros_like(q)
+            s[..., 0::2, 0::2] = (LL + HL + LH + HH) / 2
+            s[..., 0::2, 1::2] = (LL - HL + LH - HH) / 2
+            s[..., 1::2, 0::2] = (LL + HL - LH - HH) / 2
+            s[..., 1::2, 1::2] = (LL - HL - LH + HH) / 2
+            y[..., :n, :n] = s
+        return y
+
+    def forward(self, x, dim: int = 1, inverse: bool = False):
+        if dim == 0:
+            # MetaBlock routes its learnable pos_embed table (T, width) through
+            # this slot; in the coefficient domain each position is a fixed
+            # band, so the free parameter table passes through unchanged.
+            return x
+        B, T, C = x.shape
+        N, p, ch = self.N, self.p, self.ch
+        assert C == ch * p * p, f"expected token dim {ch * p * p}, got {C}"
+        img = F.fold(x.transpose(1, 2), (N, N), p, stride=p)
+        img = self._idwt(img, self.levels) if inverse else self._dwt(img, self.levels)
+        return F.unfold(img, p, stride=p).transpose(1, 2)
+
+    def matrix(self):
+        raise NotImplementedError(
+            "HaarPyramid2D acts on the folded image, not as a (T,T) token "
+            "matrix; orthogonality is verified directly in step6.")
+
+
 FEATURE_REGISTRY = {
     "haar2d": Haar2DFeatures,
     "dct2d": DCT2DFeatures,
+    "haar_pyramid": HaarPyramid2D,
 }
 
 

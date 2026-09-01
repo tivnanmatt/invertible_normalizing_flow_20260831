@@ -1,0 +1,61 @@
+# Config for step6_haar_patchify.py -- Haar pyramid AS the patchifier.
+#
+# TarFlow's patchify is a systematic non-overlapping grid of patch x patch
+# blocks in raster order (verified in step6 at startup), so token 0 is just the
+# top-left corner patch -- an arbitrary place to start an autoregression.
+#
+# Applying a depth-3 Mallat 2D Haar pyramid BEFORE patchify (and undoing it
+# after) makes the LL_3 band exactly fill the top-left 4x4 block, so token 0
+# becomes a 4x4 THUMBNAIL OF THE WHOLE IMAGE and later tokens carry
+# progressively finer detail bands. The autoregression then runs coarse-to-fine
+# over the image rather than left-to-right over corner patches -- at identical
+# cost, since T stays 64.
+#
+# The pyramid is orthogonal (|det| = 1, logdet 0), so the N(0,I) prior and the
+# official bpd accounting are untouched; variants differ ONLY in the basis.
+
+seed: 20260901
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step6_haar_patchify
+
+dataset: cifar10     # natural images: the step-4 analysis predicts the pixel
+                     # basis loses its MNIST-specific advantage here
+img_size: 32
+channel_size: 3
+patch_size: 4        # T = (32/4)^2 = 64 tokens of 3*16 = 48 values
+haar_levels: 3       # 32 -> 16 -> 8 -> 4, so LL_3 exactly fills one 4x4 patch
+noise_type: uniform  # likelihood configuration (fp32, official bpd formula)
+grad_clip: 1.0       # same stabilizer as step 4, for all variants
+
+model:               # identical to step 4 so numbers are comparable
+  channels: 128
+  blocks: 4
+  layers_per_block: 2
+
+sample_nrow: 6
+
+budget:
+  full:
+    epochs: 120
+    train_subset: 0
+    val_subset: 4000
+    test_subset: 10000
+    batch: 128
+    lr: 1.0e-3
+    sample: true
+  reduced:
+    epochs: 6
+    train_subset: 12000
+    val_subset: 2000
+    test_subset: 4000
+    batch: 128
+    lr: 1.0e-3
+    sample: true
+
+# Per-block slot schedule. H = Haar-pyramid domain (coarse-to-fine),
+# I = standard patchify order, F = standard patchify reversed.
+variants:
+  baseline_flip:  [I, F, I, F]   # official TarFlow
+  haar_alt:       [H, I, H, F]   # alternate Haar-domain and pixel-domain blocks
+  haar_pure:      [H, Hf, H, Hf] # control: every block in the Haar domain,
+                                 # direction alternated for balanced coverage

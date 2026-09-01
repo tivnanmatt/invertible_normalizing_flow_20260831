@@ -706,6 +706,291 @@ coefficients}
         is richer.
 \end{itemize}
 
+\section{Step 6: A Haar pyramid as the patchifier}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step6\_haar\_patchify.py} (+
+        \texttt{invlib.HaarPyramid2D}); config:
+        \texttt{configs/step6\_haar\_patchify.yml}; outputs:
+        \texttt{outputs/step6\_haar\_patchify/\{data,figures\}/}.
+  \item \textbf{Motivation.} Steps 4 and 5 both leave TarFlow's
+        \emph{patchifier} untouched and act on the tokens it produces, so
+        every transform studied there is composed on top of a basis choice
+        that was never itself ablated. We verified (and record in the run's
+        provenance) that \texttt{patchify} is exactly
+        \texttt{unfold(p, stride=p)}: a systematic non-overlapping grid of
+        $p \times p$ blocks in raster order, with exact round trip. Token 0
+        is therefore the top-left corner patch --- an arbitrary place for an
+        autoregression to begin.
+  \item \textbf{Construction.} Apply a depth-$L$ Mallat 2D Haar pyramid to the
+        folded image before patchify and undo it after, with $L$ chosen so the
+        $LL_L$ band exactly fills one patch ($32 \to 16 \to 8 \to 4$, so
+        $L=3$ for $p=4$). The classical subband layout then places $LL_3$ in
+        the top-left $4\times4$ block, so \textbf{token 0 becomes a $4\times4$
+        thumbnail of the whole image} --- verified numerically to equal
+        $8\times8$ average pooling times $2^L$ --- and later tokens carry
+        progressively finer detail bands. The autoregression runs
+        coarse-to-fine over the image instead of left-to-right over corner
+        patches, at \emph{identical} cost: $T$ stays 64.
+  \item Each level is the orthonormal Haar step
+        $LL,HL,LH,HH = \frac{1}{2}(a{+}b{+}c{+}d,\, a{-}b{+}c{-}d,\,
+        a{+}b{-}c{-}d,\, a{-}b{-}c{+}d)$, so the map is orthogonal. Startup
+        verification (refusing to train on failure) confirms
+        $\|QQ^\top - I\|_\infty = 0$ exactly, $|\log\det| = 0$, round-trip
+        error $<10^{-15}$, and the thumbnail identity; hence the metablock
+        likelihood accounting and the $\mathcal{N}(0,I)$ prior are untouched
+        and variants differ only in basis.
+  \item Variants are per-block slot schedules, where \texttt{I} = standard
+        patchify order, \texttt{F} = reversed, \texttt{H} = Haar-pyramid
+        domain, \texttt{Hf} = Haar domain reversed:
+        \texttt{baseline\_flip} = [I,F,I,F] (official),
+        \texttt{haar\_alt} = [H,I,H,F] (one Haar round then one pixel round in
+        the opposite order), \texttt{haar\_pure} = [H,Hf,H,Hf] (control: every
+        block in the Haar domain, direction alternated for balanced coverage).
+  \item \textbf{Dataset is CIFAR-10}, patch 4, 120 epochs, model identical to
+        step 4. Natural images are the regime where \S\ref{sec:step4analysis}
+        predicts the pixel basis loses its MNIST-specific advantage.
+  \item Two defects found in step 4 are fixed here: sample grids are written
+        with an explicit \texttt{value\_range=(-1,1)} so brightness and
+        contrast are comparable across variants, and model weights are
+        checkpointed so grids can be re-rendered without retraining.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step6_haar_patchify.yml}}
+
+\subsection{Results}
+\begin{center}
+\InputIfFileExists{../outputs/step6_haar_patchify/data/ranking_table.tex}{}
+  {\emph{not generated yet -- run \texttt{python step6\_haar\_patchify.py}.}}
+\end{center}
+
+\InputIfFileExists{../outputs/step6_haar_patchify/data/figures_step6.tex}{}
+  {\emph{not generated yet.}}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step6analysis}
+\begin{itemize}
+  \item \textbf{The construction is exactly as designed, and it does not
+        help.} On CIFAR-10 at 120 epochs the official ordering wins:
+        \texttt{baseline\_flip} 3.683 test bpd versus \texttt{haar\_alt}
+        3.814, with \texttt{haar\_pure} further behind. Making token 0 a
+        thumbnail of the whole image, and running the autoregression
+        coarse-to-fine, costs about 0.13 bits/dim rather than saving any. The
+        result is reported as measured; the ranking table above is the
+        primary readout.
+  \item \textbf{It is also not free in wall time}, despite $T$ being
+        unchanged: 18.9 minutes versus 12.6 for the baseline, because the
+        fold / 3-level DWT / unfold runs inside every Haar block on every
+        forward and backward pass. The FLOP count of the transform is
+        negligible; the cost is memory traffic and kernel launches on small
+        tensors.
+  \item \textbf{Why this is consistent with step 4 rather than surprising.}
+        \S\ref{sec:step4analysis} found that the fixed-basis ordering is
+        governed by how much exploitable sparsity a basis preserves, and that
+        on CIFAR-10 no basis has any near-constant dimensions to preserve.
+        What remains is locality: raster patches give the autoregression
+        spatially contiguous context, and mixing across a $32\times32$
+        support --- even a multiresolution one --- dilutes that. The
+        coarse-to-fine \emph{ordering} is intuitively appealing, but at fixed
+        model capacity it appears to trade away more local structure than the
+        global structure it buys.
+  \item \textbf{A caveat on what was actually tested.} Only the tokenization
+        \emph{basis} changed; the patch grid, model, budget and optimizer are
+        identical. In particular the flip alternation is retained, so in
+        \texttt{haar\_alt} half the blocks traverse the Haar coefficients
+        fine-to-coarse, which is the opposite of the coarse-to-fine intuition
+        the design is built on. \texttt{haar\_pure} isolates the Haar domain
+        but alternates direction for the same reason. A schedule that is
+        strictly coarse-first in every block was not run, because
+        \S\ref{sec:step4analysis} shows unbalanced context coverage is
+        catastrophic (\texttt{identity\_only}); disentangling ``coarse-first''
+        from ``balanced coverage'' needs a variant that achieves both.
+  \item Follow-ups: the same comparison on MNIST, where the pixel basis has a
+        measured 38\% near-constant advantage and the gap should therefore be
+        \emph{larger}, as a falsifiable check of the sparsity account; and
+        smoother wavelets (CDF~9/7, Daubechies-4), whose better energy
+        compaction on natural images is the main reason to expect Haar's
+        blocky step functions to be the weakest member of the family.
+\end{itemize}
+
+\section{Step 7: A system-embedded flow bridge for inverse problems}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step7\_system\_bridge.py} + \texttt{measlib.py}; config:
+        \texttt{configs/step7\_system\_bridge.yml}; outputs:
+        \texttt{outputs/step7\_system\_bridge/\{data,figures\}/}.
+  \item \textbf{Goal.} A normalizing-flow analogue of System-embedded
+        Diffusion Bridge Models (SDB; Sobieski, Tivnan, Wang, Yoon, Jin, Wu, Li and
+        Biecek, \texttt{arXiv:2506.23726}), which embed a known
+        linear measurement system into the coefficients of a matrix-valued
+        SDE. Here the same system is embedded into the \emph{base density} of
+        an exact-likelihood flow, so the model retains a tractable
+        conditional likelihood --- the one thing diffusion bridges
+        structurally cannot provide.
+  \item \textbf{Setting.} A known linear system with additive Gaussian white
+        noise, $y = Ax + \sigma\epsilon$, i.e.\
+        $p(y|x) = \mathcal{N}(Ax, \sigma^2 I)$. Standard TarFlow trains
+        $\log p(x) = \log \mathcal{N}(f(x); 0, I) + \log|\det J_f|$. We
+        replace the standard normal by the SDB bridge endpoint at $t=1$:
+        \[
+          \log p(x|y) = \log \mathcal{N}\!\left(f(x);\, A^{+}y,\, \Sigma_1\right)
+                        + \log|\det J_f|, \qquad
+          \Sigma_1 = \gamma A^{+}\Sigma A^{+\top} + \beta\,(I - A^{+}A).
+        \]
+        For every fixed $y$ this is a proper density in $x$ (the change of
+        variables integrates to one), so it trains by exact maximum
+        likelihood on paired $(x,y)$ and reports an honest \emph{conditional}
+        bits/dim. Sampling $z \sim \mathcal{N}(A^{+}y, \Sigma_1)$ and
+        returning $f^{-1}(z)$ yields a posterior sample.
+  \item \textbf{$\sigma > 0$ is required, not optional.} With a noiseless
+        measurement the range block of $\Sigma_1$ is singular, the base
+        degenerates to a delta on the range space, and the flow likelihood is
+        undefined. The constructor asserts it. Physically this is only the
+        statement that every measurement carries noise.
+  \item \textbf{Why no conditioning network is needed.} $f$ is
+        \emph{unconditional}. At the optimum it must act on the range space
+        like the projector $A^{+}A$ --- then $f(x) - A^{+}y$ is exactly the
+        measurement noise $-A^{+}n$, whose law is precisely the range block of
+        $\Sigma_1$ --- while on the null space it must Gaussianise the
+        unmeasured content to $\mathcal{N}(0,\beta)$. The measurement enters
+        only through the base's mean and covariance. The conditioning that
+        inpainting demands (what belongs in the hole depends on the
+        surroundings) is supplied by TarFlow's own autoregression: later
+        tokens attend to earlier ones, so generated null-space content is
+        conditioned on observed range-space content. Nothing in the official
+        model is modified. A corollary worth noting: the identity map is
+        already a well-scaled initialisation, since with $f = \mathrm{id}$ the
+        range residual is exactly $-A^{+}n$ by construction, leaving the flow
+        only the null-space prior to learn.
+  \item \textbf{Implementation via the SVD, with no matrix ever formed.}
+        Writing $A = USV^\top$, every quantity is elementwise in the
+        right-singular-vector coordinates $c = V^\top x$: the pseudo-inverse
+        reconstruction is $c_i + (\sigma/s_i)\epsilon_i$ on the range and $0$
+        on the null space; $A^{+}A = V\,\mathrm{diag}(s_i > 0)\,V^\top$; and
+        $\Sigma_1 = V\,\mathrm{diag}(\gamma\sigma^2/s_i^2,\ \beta)\,V^\top$ is
+        \emph{diagonal}. An operator is therefore fully specified by an
+        orthogonal basis $V$ and a vector of singular values, which is what
+        makes the exact Gaussian base density cheap to evaluate.
+  \item \textbf{Measurement systems} (all with analytic SVD):
+        \texttt{denoise} ($A = I$, no null space);
+        \texttt{inpaint\_box} (centred $12\times12$ hole, 144 null dims);
+        \texttt{inpaint\_random} (fixed 50\% pixel mask);
+        \texttt{sr\_2x} / \texttt{sr\_4x} ($2\times2$ / $4\times4$ average
+        pooling, where $V$ is the block Haar transform of step 6 and the null
+        space is exactly the detail bands that downsampling discards). Masks
+        are fixed rather than resampled per image: the system is known and
+        fixed, as in the supervised bridge setting.
+  \item \textbf{Self-tests gate training.} \texttt{measlib.self\_test()} runs
+        before any run and aborts on failure. All five systems pass with
+        $\|VV^\top - I\|_\infty = 0$, projector idempotence and symmetry
+        $= 0$, correct rank, noiseless pseudo-inverse equal to the projector
+        to $10^{-12}$, empirical base covariance matching $\Sigma_1$, and the
+        base log-density matching a hand-computed multivariate normal exactly.
+  \item \textbf{Metrics.} Conditional bits/dim (the training objective, using
+        the official 8-bit dequantization constant); PSNR of the
+        pseudo-inverse, of a single posterior sample, and of the posterior
+        mean over draws; and a \textbf{data-consistency} error, the relative
+        range-space disagreement between a posterior sample and $A^{+}y$.
+        The last is measured rather than assumed: nothing architecturally
+        forces $f$ to act like $A^{+}A$ on the range, so whether $f^{-1}$
+        respects the measurement is an empirical test of the central claim.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step7_system_bridge.yml}}
+
+\subsection{Results}
+\begin{center}
+\InputIfFileExists{../outputs/step7_system_bridge/data/ranking_table.tex}{}
+  {\emph{not generated yet -- run \texttt{python step7\_system\_bridge.py}.}}
+\end{center}
+
+\IfFileExists{../outputs/step7_system_bridge/figures/bpd_overlay.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.8\textwidth]{outputs/step7_system_bridge/figures/bpd_overlay.png}
+\caption{Conditional bits/dim per epoch for each measurement system.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step7_system_bridge/figures/denoise_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/denoise_posterior.png}
+\caption{\textbf{denoise}. Rows: ground truth; pseudo-inverse $A^{+}y$; three
+posterior samples $f^{-1}(z)$, $z \sim \mathcal{N}(A^{+}y,\Sigma_1)$; posterior
+mean over 8 draws.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step7_system_bridge/figures/inpaint_box_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/inpaint_box_posterior.png}
+\caption{\textbf{inpaint\_box}. Rows as above. The null space is the 144
+masked pixels; posterior variation across samples is confined to the hole.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step7_system_bridge/figures/sr_4x_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.7\textwidth]{outputs/step7_system_bridge/figures/sr_4x_posterior.png}
+\caption{\textbf{sr\_4x}. Rows as above. Only an $8\times8$ thumbnail is
+measured; 960 of 1024 dimensions are null space.}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step7analysis}
+\begin{itemize}
+  \item \emph{Results pending: the three-system run
+        (\texttt{denoise}, \texttt{inpaint\_box}, \texttt{sr\_4x}) is queued
+        behind step 6 on the single available GPU. This subsection is written
+        once the numbers exist; the table and figures above regenerate
+        automatically from \texttt{outputs/}.}
+  \item \textbf{What the conditional bpd does and does not mean.}
+        $-\log p(x|y)/(D\ln 2)$ is a conditional quantity: it falls trivially
+        as the measurement becomes more informative, so it is comparable
+        across methods only at fixed $(A, \sigma)$, never across measurement
+        operators or noise levels. The \texttt{denoise} system (no null space)
+        and \texttt{sr\_4x} (960 null dimensions of 1024) are therefore not
+        competing with each other; each is its own experiment. The constant
+        $-\tfrac{1}{2}\log\det\Sigma_1$ is included in every reported number,
+        as it must be for the value to be a likelihood --- it is easy to drop
+        because it does not affect gradients.
+  \item \textbf{The falsifiable claims.} (i) Data-consistency error should be
+        small: if $f$ has learned to act like $A^{+}A$ on the range, posterior
+        samples reproduce the measurement without any projection step being
+        imposed. (ii) Posterior samples should differ from each other only in
+        the null space. (iii) The posterior mean should beat a single sample
+        on PSNR while being blurrier, the usual MMSE-versus-sample trade-off.
+        Each is measured directly and any failure is reported.
+  \item \textbf{Honest framing relative to SDB.} This is a bridge in the sense
+        that the base is the pseudo-inverse distribution rather than white
+        noise; it is \emph{not} a stochastic process with intermediate
+        marginals. SDB's power comes partly from the schedules
+        $\alpha_t, \beta_t, \gamma_t$ annealing the problem over many steps,
+        whereas a flow must absorb all of that into a single bijection.
+        TarFlow's block stack supplies an implicit time axis, so the faithful
+        analogue --- making block $k$ target the SDB marginal at $t_k$ --- is
+        the natural next step and the version that would actually inherit the
+        bridge structure.
+  \item \textbf{Known limitation.} A trained model is tied to the system it
+        was trained on. SDB reports robustness under system misspecification;
+        the flow bridge as built here has no mechanism for that, since $A$
+        enters only through a fixed base density. Conditioning $f$ on $A$ (or
+        on $A^{+}y$ as an auxiliary input) is required before any
+        generalisation claim.
+  \item \textbf{Connection to steps 4--6.} $\Sigma_1$ is diagonal in the
+        right-singular-vector basis $V$, so the physics supplies a natural
+        tokenization: order tokens by singular value and the autoregression
+        generates well-determined content first and unmeasured content last,
+        conditioned on it. That is the coarse-to-fine ordering of step 6 with
+        the ordering induced by the measurement operator rather than by a
+        wavelet. Steps 4 and 6 both found that reordering away from raster
+        patches costs likelihood, so this is a genuine open question rather
+        than an obvious win; the SVD ordering is not used in the runs above,
+        which keep the official ordering throughout.
+\end{itemize}
+
 \section{Reproducibility}
 \begin{itemize}
   \item Global seed \texttt{20260831} (config) seeds torch, numpy, and every

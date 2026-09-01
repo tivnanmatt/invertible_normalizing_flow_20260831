@@ -1,0 +1,77 @@
+# Config for step7_system_bridge.py -- flow bridge from the pseudo-inverse.
+#
+# For a linear system y = A x + sigma*eps, the flow's base density is replaced
+# by the SDB bridge endpoint  N(A^+y, Sigma_1)  with
+#     Sigma_1 = gamma A^+ Sigma A^+T + beta (I - A^+A),   Sigma = sigma^2 I
+# so training maximises an exact conditional likelihood log p(x|y) and
+# f^-1 of a base sample is a posterior sample.
+#
+# sigma MUST be > 0 for every system: a noiseless measurement makes the range
+# block of Sigma_1 singular and the base density undefined.
+#
+# gamma scales the range (measurement-noise) block; beta is the null-space
+# variance -- the scale of the information the measurement never saw, which is
+# what the flow has to generate. beta = 1 matches the [-1,1] data scale.
+
+seed: 20260901
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step7_system_bridge
+
+dataset: mnist
+img_size: 32
+channel_size: 1
+patch_size: 4        # T = 64 tokens, same protocol as steps 4 and 6
+noise_type: uniform
+grad_clip: 1.0
+
+model:               # identical to steps 4/6 so numbers stay comparable
+  channels: 128
+  blocks: 4
+  layers_per_block: 2
+
+budget:
+  full:
+    epochs: 120
+    train_subset: 0
+    val_subset: 4000
+    test_subset: 10000
+    batch: 128
+    lr: 1.0e-3
+  reduced:
+    epochs: 6
+    train_subset: 12000
+    val_subset: 2000
+    test_subset: 4000
+    batch: 128
+    lr: 1.0e-3
+
+# Each entry is one known linear measurement system. `kind` selects the operator
+# from measlib.REGISTRY; remaining keys are its constructor arguments.
+systems:
+  denoise:                     # A = I, full rank, NO null space: the flow only
+    kind: denoise              # has to undo noise, never to invent content
+    sigma: 0.2
+    beta: 1.0
+
+  inpaint_box:                 # centred 12x12 hole: 144 unmeasured pixels
+    kind: inpaint_box
+    sigma: 0.05
+    box: 12
+    beta: 1.0
+
+  inpaint_random:              # 50% of pixels dropped, fixed mask
+    kind: inpaint_random
+    sigma: 0.05
+    drop: 0.5
+    seed: 0
+    beta: 1.0
+
+  sr_2x:                       # 2x2 average pooling; null space = Haar details
+    kind: sr_2x
+    sigma: 0.05
+    beta: 1.0
+
+  sr_4x:                       # 4x4 average pooling; only a 8x8 thumbnail seen
+    kind: sr_4x
+    sigma: 0.05
+    beta: 1.0

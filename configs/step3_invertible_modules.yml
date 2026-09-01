@@ -10,6 +10,10 @@ dims:
                     # Jacobian logdet check stays cheap: D = C*H*W = 128)
   seq: 64           # T for sequence transforms (power of 2: Haar/Hadamard)
 
+feature_domain:     # context for the 2D feature-domain tokenizers
+  img_size: 32
+  patch_size: 4     # T = 64 tokens of 16 coefficients
+
 batch: 64           # batch for reconstruction + timing
 timing_reps: 25     # median over this many timed calls
 viz_patch: 4        # patch size for the MNIST coefficient gallery (32/4 -> T=64)

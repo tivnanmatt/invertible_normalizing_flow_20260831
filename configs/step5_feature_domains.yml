@@ -1,0 +1,52 @@
+# Config for step5_feature_domains.py -- per-block feature-domain ablation.
+#
+# Each metablock analyzes the image into an orthogonal 2D coefficient domain
+# (or stays in the pixel/patch domain), runs the causal AR update there, and
+# synthesizes back to the image immediately after -- blocks always map
+# image -> image and heterogeneous domains stack. Same controlled protocol as
+# step 4 (identical init/data/budget; only the per-block domains differ).
+
+seed: 20260901
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step5_feature_domains
+
+dataset: mnist
+img_size: 32        # zero-padded from 28; 2D Haar needs a power of 2
+channel_size: 1
+patch_size: 4       # T = 64 tokens of 16 coefficients
+noise_type: uniform
+grad_clip: 1.0      # uniform stabilizer (see step 4: coefficient scales)
+
+model:
+  channels: 128
+  blocks: 4
+  layers_per_block: 2
+
+sample_nrow: 6
+
+budget:
+  full:             # GPU profile
+    epochs: 12
+    train_subset: 0
+    val_subset: 4000
+    test_subset: 10000
+    batch: 128
+    lr: 1.0e-3
+    sample: true
+  reduced:          # CPU profile (GPU down; rerun full after reboot)
+    epochs: 6
+    train_subset: 12000
+    val_subset: 2000
+    test_subset: 4000
+    batch: 128
+    lr: 1.0e-3
+    sample: true
+
+variants:
+  - pixels_flip     # official baseline anchor [I, F, I, F]
+  - haar2d_alt      # alternate pixel / Haar-domain blocks [I, H, F, H.F]
+  - dct2d_alt       # alternate pixel / DCT-domain blocks  [I, D, F, D.F]
+  - haar2d_flip     # all blocks Haar coarse-to-fine, direction alternates
+  - dct2d_flip      # all blocks DCT low-to-high, direction alternates
+  - haar2d_pure_dc  # all blocks Haar, no flips; invariant coarse token
+                    # modeled by per-dimension Gaussian KDE (fit post-training)

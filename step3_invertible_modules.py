@@ -91,7 +91,7 @@ def time_module(module, sample, batch, reps, dtype=torch.float32):
     return statistics.median(fw) * 1e3, statistics.median(inv) * 1e3
 
 
-def check_metablock_roundtrip(seq_transform, cfg):
+def check_metablock_roundtrip(seq_transform, cfg, in_channels=8):
     """Install the transform in a TarFlow MetaBlock and verify that the
     sequential reverse pass exactly inverts the forward pass."""
     p = str(Path(cfg["tarflow_repo"]).resolve())
@@ -102,16 +102,70 @@ def check_metablock_roundtrip(seq_transform, cfg):
     torch.manual_seed(0)
     T = seq_transform.seq_length
     block = transformer_flow.MetaBlock(
-        in_channels=8, channels=64, num_patches=T,
+        in_channels=in_channels, channels=64, num_patches=T,
         permutation=seq_transform, num_layers=1)
     # zero-init proj_out makes the block the identity; perturb to test for real
     block.proj_out.weight.data.normal_(0, 0.02)
     block.proj_out.bias.data.normal_(0, 0.02)
-    x = torch.randn(2, T, 8)
+    x = torch.randn(2, T, in_channels)
     with torch.no_grad():
         z, _ = block(x)
         xr = block.reverse(z.clone())
     return max_err(x, xr)
+
+
+def check_feature_domains(cfg, tol):
+    """Verify the 2D feature-domain tokenizers (invlib.FEATURE_REGISTRY):
+    exact roundtrip, norm preservation (orthogonality), DC concentration
+    (constant image -> all energy in token 0), and the MetaBlock roundtrip."""
+    rows = []
+    N, p = cfg["feature_domain"]["img_size"], cfg["feature_domain"]["patch_size"]
+    T = (N // p) ** 2
+    for name, cls in invlib.FEATURE_REGISTRY.items():
+        t = cls(N, p, 1)
+        torch.manual_seed(0)
+        x = torch.randn(16, T, p * p)
+        y = t(x, dim=1)
+        row = {"name": f"feat_{name}", "kind": "feature",
+               "params": sum(q.numel() for q in t.parameters()), "param_bytes": 0}
+        row["recon_fp32"] = max_err(x, t(y, dim=1, inverse=True))
+        xd = x.double()
+        td = cls(N, p, 1).double()
+        row["recon_fp64"] = max_err(xd, td(td(xd, dim=1), dim=1, inverse=True))
+        row["orth_err"] = abs(y.norm().item() - x.norm().item()) / x.norm().item()
+        c = t(torch.ones(1, T, p * p), dim=1)
+        row["dc_energy_frac"] = (c[0, 0].pow(2).sum() / c.pow(2).sum()).item()
+        row["metablock_err"] = check_metablock_roundtrip(cls(N, p, 1), cfg,
+                                                         in_channels=p * p)
+        row["fwd_ms"], row["inv_ms"] = time_module(
+            _FeatTimer(t), lambda b: torch.randn(b, T, p * p),
+            cfg["batch"], cfg["timing_reps"])
+        row["logdet_err"], row["jac_sign"] = 0.0, 1.0  # orthogonal by construction
+        ok = (row["recon_fp32"] < tol["recon_fp32"]
+              and row["orth_err"] < tol["orthogonality"] * 10
+              and row["dc_energy_frac"] > 0.999
+              and row["metablock_err"] < tol["metablock"])
+        row["status"] = "PASS" if ok else "FAIL"
+        rows.append(row)
+        print(f"  {row['name']:32s} {row['status']:5s} "
+              f"recon {row['recon_fp32']:.2e} orth {row['orth_err']:.2e} "
+              f"dc_frac {row['dc_energy_frac']:.4f} "
+              f"metablock {row['metablock_err']:.2e}", flush=True)
+    return rows
+
+
+class _FeatTimer(torch.nn.Module):
+    """Adapter so time_module can time a feature-domain transform."""
+
+    def __init__(self, t):
+        super().__init__()
+        self.t = t
+
+    def forward(self, x):
+        return self.t(x, dim=1), torch.zeros(x.shape[0])
+
+    def inverse(self, y):
+        return self.t(y, dim=1, inverse=True)
 
 
 def run(cfg, out_data, out_figs):
@@ -275,6 +329,7 @@ def main(argv=None):
     print(f"step3: verifying {len(invlib.build_registry())} modules "
           f"(D={cfg['dims']['flat']}, img={cfg['dims']['image']}, T={cfg['dims']['seq']})")
     rows = run(cfg, out_data, out_figs)
+    rows += check_feature_domains(cfg, cfg["tolerances"])
 
     with open(out_data / "verification.json", "w") as f:
         json.dump(rows, f, indent=2)

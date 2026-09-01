@@ -225,6 +225,99 @@ class SeqCompose(SeqTransform):
         return q
 
 
+# --------------------------------------------------------------------------
+# Feature-domain transforms: replace the MEANING of the token sequence.
+#
+# Unlike the SeqTransforms above (which mix token vectors across the sequence
+# position only), these act on the whole image: tokens -> image (fold) ->
+# separable 2D orthogonal transform -> coarse-to-fine coefficient ordering ->
+# re-chunk into tokens. Token 0 becomes the coarse approximation (containing
+# the DC coefficient) and later tokens are progressively finer detail, so a
+# causal AR model conditions fine structure on coarse structure.
+#
+# They keep TarFlow's permutation-slot signature and are orthogonal on the
+# flattened (T*C) space (fold/unfold are permutations; H X H^T with orthogonal
+# H is orthogonal; reordering is a permutation), so |det| = 1 and the
+# metablock likelihood accounting is untouched.
+# --------------------------------------------------------------------------
+
+
+class FeatureDomain2D(SeqTransform):
+    """Base: tokens (B,T,C) -> image -> 2D transform (per channel) ->
+    coefficient ordering -> tokens. Single-channel-per-pixel images with
+    C = channels * patch^2; matches Model.patchify/unpatchify conventions."""
+
+    def __init__(self, img_size: int, patch_size: int, channels: int = 1):
+        T = (img_size // patch_size) ** 2
+        super().__init__(T)
+        self.N, self.p, self.ch = img_size, patch_size, channels
+        h64 = self._matrix_1d(img_size)                    # (N,N) float64
+        self.register_buffer("H", h64.to(torch.float32))
+        order = self._coeff_order(img_size)                # (N*N,) long
+        self.register_buffer("order", order)
+        self.register_buffer("inv_order", torch.argsort(order))
+
+    def _matrix_1d(self, n):
+        raise NotImplementedError
+
+    def _coeff_order(self, n):
+        raise NotImplementedError
+
+    def forward(self, x, dim: int = 1, inverse: bool = False):
+        if dim == 0:
+            # MetaBlock transforms its learnable pos_embed table (T, width)
+            # through this slot. In the coefficient domain each position t is
+            # a fixed coefficient group, so the table is returned unchanged:
+            # positions get their own learned embeddings directly (identity is
+            # a valid, fully general choice for a free parameter).
+            return x
+        B, T, C = x.shape
+        N, p, ch = self.N, self.p, self.ch
+        assert C == ch * p * p, f"expected token dim {ch * p * p}, got {C}"
+        h = self.H.to(dtype=x.dtype, device=x.device)
+        if not inverse:
+            img = F.fold(x.transpose(1, 2), (N, N), p, stride=p)   # (B,ch,N,N)
+            coef = h @ img @ h.t()                                  # analysis
+            flat = coef.reshape(B, ch, N * N)[:, :, self.order]     # coarse->fine
+            return flat.reshape(B, ch, T, p * p).permute(0, 2, 1, 3).reshape(B, T, C)
+        flat = x.reshape(B, T, ch, p * p).permute(0, 2, 1, 3).reshape(B, ch, N * N)
+        coef = torch.zeros_like(flat)
+        coef[:, :, self.order] = flat
+        img = h.t() @ coef.reshape(B, ch, N, N) @ h                 # synthesis
+        return F.unfold(img, p, stride=p).transpose(1, 2)
+
+
+class Haar2DFeatures(FeatureDomain2D):
+    """Full 2D multiresolution Haar analysis; ordering by max(scale_i, scale_j)
+    so token 0 is the coarsest (LL) band including the DC coefficient."""
+
+    def _matrix_1d(self, n):
+        return haar_matrix(n)
+
+    def _coeff_order(self, n):
+        s = [0] + [int(math.floor(math.log2(r))) + 1 for r in range(1, n)]
+        keys = [(max(s[i], s[j]), i, j) for i in range(n) for j in range(n)]
+        return torch.tensor(sorted(range(n * n), key=lambda k: keys[k]), dtype=torch.long)
+
+
+class DCT2DFeatures(FeatureDomain2D):
+    """Full 2D orthonormal DCT-II; zigzag-style low-to-high frequency ordering
+    (JPEG-like), token 0 = lowest spatial frequencies including DC."""
+
+    def _matrix_1d(self, n):
+        return dct_matrix(n)
+
+    def _coeff_order(self, n):
+        keys = [(i + j, i, j) for i in range(n) for j in range(n)]
+        return torch.tensor(sorted(range(n * n), key=lambda k: keys[k]), dtype=torch.long)
+
+
+FEATURE_REGISTRY = {
+    "haar2d": Haar2DFeatures,
+    "dct2d": DCT2DFeatures,
+}
+
+
 SEQ_REGISTRY = {
     "identity": SeqIdentity,
     "flip": SeqFlip,

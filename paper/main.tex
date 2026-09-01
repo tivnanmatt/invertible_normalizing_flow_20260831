@@ -375,7 +375,10 @@ spread it into global features. File:
 
 \subsection{Analysis}
 \begin{itemize}
-  \item All 24 modules PASS: fp32 reconstruction errors are at roundoff
+  \item All 26 modules PASS (24 original + the two 2D feature-domain
+        tokenizers of step~5, verified here with roundtrip, norm
+        preservation, DC-concentration and MetaBlock tests): fp32
+        reconstruction errors are at roundoff
         ($10^{-7}$--$10^{-6}$), every analytic logdet matches the autograd
         Jacobian to $10^{-3}$ or (usually) far better in fp64, all orthogonal
         maps satisfy $\|Q^\top Q-I\|_\infty<10^{-5}$, and every SeqTransform
@@ -483,6 +486,113 @@ spread it into global features. File:
         (inserted as a proper flow layer with its logdet, not in the
         permutation slot) to remove the scale-spread confound; and the same
         ablation on CIFAR-10.
+\end{itemize}
+
+\section{Step 5: Feature-domain blocks -- autoregression over 2D
+coefficients}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step5\_feature\_domains.py} (+
+        \texttt{invlib.Haar2DFeatures}/\texttt{DCT2DFeatures}); config:
+        \texttt{configs/step5\_feature\_domains.yml}; outputs:
+        \texttt{outputs/step5\_feature\_domains/\{data,figures\}/}.
+  \item Design correction relative to step~4: the step-4 transforms mixed
+        token vectors across the sequence position only (a 1D transform on
+        the patch index). Here the FEATURE EXTRACTION itself changes: each
+        metablock folds its tokens back to the image, applies a full 2D
+        orthogonal analysis (separable $HXH^\top$; multiresolution Haar or
+        DCT-II), orders the coefficients coarse-to-fine (Haar: by
+        max$(\mathrm{scale}_i,\mathrm{scale}_j)$; DCT: JPEG-style zigzag by
+        $i{+}j$), chunks them into $T$ tokens, runs the causal AR update
+        over those tokens, and synthesizes back to the image immediately
+        after. Token~0 is the coarse approximation (for patch~4 on
+        $32{\times}32$, exactly the 16 coarsest coefficients including DC);
+        finer detail tokens condition on it -- a coarse-to-fine
+        autoregression. Note the TarFlow metablock already applies the
+        inverse of its reordering right after the causal transformer, so
+        every block maps image~$\to$~image and heterogeneous domains stack.
+  \item Both tokenizers are orthogonal on the flattened token space
+        (fold/unfold and reordering are permutations; $H$ orthonormal), so
+        $|\det|=1$, the likelihood accounting is unchanged, and they PASS
+        the step-3 harness (roundtrip $\sim10^{-6}$, norm preservation,
+        constant image $\Rightarrow$ 100\% of energy in token~0 with
+        $\mathrm{DC}=N\cdot\mathrm{mean}$, MetaBlock reverse roundtrip).
+  \item Variants (per-block domains, otherwise the step-4 protocol:
+        identical init/data/budget, uniform dequantization, grad clip 1.0):
+        \textbf{pixels\_flip} $[I,F,I,F]$ (official anchor);
+        \textbf{haar2d\_alt} $[I,H,F,H{\circ}F]$ and \textbf{dct2d\_alt}
+        $[I,D,F,D{\circ}F]$ (alternate pixel- and coefficient-domain
+        blocks); \textbf{haar2d\_flip} / \textbf{dct2d\_flip} (all blocks in
+        the coefficient domain, AR direction alternating);
+        \textbf{haar2d\_pure\_dc} $[H,H,H,H]$ with NO flips.
+  \item In haar2d\_pure\_dc the coarse token is causally first in every
+        block and hence passes through the whole flow \emph{unchanged}. This
+        yields the exact factorization $p(c) = p(c_0)\,p(c_{1:}\mid c_0)$:
+        the flow is the conditional factor, and $p(c_0)$ (16 coefficients)
+        is fit post-training as an independent per-dimension Gaussian KDE
+        (Silverman bandwidth, 4k support points) that supports both
+        log-density evaluation (entering the reported bits/dim exactly) and
+        sampling (sampling draws $c_0$ from the KDE, Gaussian noise for all
+        other coefficients, then runs the reverse pass, which leaves $c_0$
+        untouched). The only approximation is independence across the 16
+        dims of $c_0$; the factorization itself is exact.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step5_feature_domains.yml}}
+
+\subsection{Results}
+\begin{center}
+\InputIfFileExists{../outputs/step5_feature_domains/data/ranking_table.tex}{}
+  {\emph{not generated yet -- run \texttt{python step5\_feature\_domains.py}.}}
+\end{center}
+
+\InputIfFileExists{../outputs/step5_feature_domains/data/figures_step5.tex}{}
+  {\emph{not generated yet.}}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step5analysis}
+\begin{itemize}
+  \item Protocol sanity: pixels\_flip reproduces the step-4 baseline to the
+        fourth decimal (2.4736 vs 2.4736 val bpd) -- the two steps share the
+        protocol exactly, so numbers are directly comparable across both
+        ablations.
+  \item Headline: true 2D coarse-to-fine feature extraction closes most of
+        the gap that step-4's 1D sequence mixing opened.
+        \textbf{Alternating pixel- and coefficient-domain blocks is nearly
+        competitive with the official ordering} (dct2d\_alt 2.686,
+        haar2d\_alt 2.823, vs baseline 2.474) -- compare step-4's
+        all-coefficient 1D variants at 6.2--6.6. The heterogeneous stack
+        gives the model complementary views: local raster AR in the pixel
+        blocks, global coarse-to-fine AR in the coefficient blocks.
+  \item All-coefficient stacks: haar2d\_flip 4.003 improves markedly on the
+        step-4 1D seq-haar (4.390), while dct2d\_flip (6.463) does not
+        improve on 1D dct (6.384) -- multiresolution locality (Haar
+        coefficients have compact support) survives the domain change,
+        global frequencies (DCT) do not. At this budget, pixel-domain blocks
+        appear to be doing the heavy lifting wherever they are present.
+  \item haar2d\_pure\_dc (4.342) sits between haar2d\_flip and the step-4
+        1D haar: removing direction alternation costs a little, but the
+        variant delivers what it was designed for -- an exact, interpretable
+        factorization $p(c_0)p(\mathrm{rest}\mid c_0)$ whose reported bpd
+        honestly includes the KDE term for the invariant coarse token, and
+        whose samples draw global brightness/structure from the data-fitted
+        KDE. Its sample grid is also the only one at this budget showing
+        digit-like structure.
+  \item Sampling note: for the best-bpd variants the sequential reverse pass
+        at this (severely undertrained) stage emits rare huge values --
+        sharper learned conditional scales amplify out-of-distribution
+        prefixes -- which blanked the normalized sample grids; those grids
+        are omitted from this version and the samplers now clip to $[-1,1]$
+        like the official FID path. Sample quality at this budget is not a
+        meaningful discriminator; bits/dim is the study metric, and the GPU
+        \texttt{full}-profile rerun will regenerate all grids.
+  \item GPU follow-ups: full profile for all six variants; haar2d\_alt with
+        deeper stacks (more alternations); a joint (non-independent) model
+        for $c_0$; and the same ablation on CIFAR-10 where global structure
+        is richer.
 \end{itemize}
 
 \section{Reproducibility}

@@ -225,7 +225,10 @@ def run_variant(name, cfg, bud, device, out_data, out_figs):
                             generator=torch.Generator().manual_seed(cfg["seed"]))
         with torch.no_grad():
             samples = model.reverse(noise.to(device))
-        tv.utils.save_image(samples.float(), out_figs / f"{name}_samples.png",
+        # clip like the official FID path: undertrained AR reverses can emit
+        # rare huge values that would blank the normalized grid
+        tv.utils.save_image(samples.float().clamp(-1, 1),
+                            out_figs / f"{name}_samples.png",
                             normalize=True, nrow=cfg["sample_nrow"])
 
     with open(out_data / f"{name}_result.json", "w") as f:

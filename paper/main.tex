@@ -419,12 +419,14 @@ spread it into global features. File:
   \item Tracked per variant: val bits/dim per epoch, final test bits/dim,
         wall time, transform parameter overhead, and (on GPU) peak memory;
         plus a sample grid from the reverse pass.
-  \item Budget profiles: \texttt{full} (GPU: 12 epochs, all 54k train) and
-        \texttt{reduced} (CPU: 6 epochs, 12k subset). The run reported in
-        this version used the \texttt{reduced} CPU profile because the
-        host's GPUs were unavailable (GPU~1 hardware failure, reboot
-        pending); the identical command re-runs the \texttt{full} profile on
-        GPU afterwards.
+  \item Budget profiles: \texttt{full} (GPU: 120 epochs, all 54k train) and
+        \texttt{reduced} (CPU: 6 epochs, 12k subset). The run reported here
+        is the \texttt{full} GPU profile: all ten variants at 120 epochs on
+        one RTX~4090, identical init, data order and budget. An earlier
+        version of this document reported the \texttt{reduced} CPU profile
+        (6 epochs, 12k subset), run while the host GPUs were unavailable;
+        \S\ref{sec:step4analysis} records where the two disagree, because
+        they disagree substantially.
 \end{itemize}
 
 \subsection{Configuration (verbatim)}
@@ -449,43 +451,139 @@ spread it into global features. File:
         autoregression, not noise in the setup. The finite-epoch caveat
         applies by design: this measures which basis trains \emph{fastest},
         not which wins asymptotically.
+  \item \textbf{The 6-epoch ranking did not survive the 120-epoch run, and
+        the reversals are large.} Test bits/dim at 120 epochs:
+        baseline\_flip 1.171, cayley 1.203, haar 1.608, random\_perm 2.157,
+        householder 2.199, hadamard 2.780, dct 2.943, rand\_ortho 3.122,
+        hartley 3.165, identity\_only 11.168. Against the reduced run:
+        haar moves from 4.390 (reported as a failure, tied with the
+        do-nothing control) to \emph{third place} at 1.608; the dense
+        global bases move from 6.2--7.3 to 2.78--3.17; and identity\_only
+        moves the other way, from 4.403 to 11.168. Every dense-basis
+        variant was still improving at epoch 120 (e.g.\ haar gained 0.035
+        bits/dim over its last 20 epochs versus the baseline's 0.020), so
+        the 6-epoch numbers were measuring \emph{convergence speed}, not
+        final quality. Any finite-budget ablation of this kind should be
+        read with that confound in mind.
   \item A first pass was run WITHOUT gradient clipping (archived in
         \texttt{outputs/step4\_tarflow\_ablation/data\_noclip/}): ranking
         cayley 2.507 $<$ baseline\_flip 2.625 $\ll$ identity\_only 4.524 $<$
         random\_perm 4.773 $\ll$ hartley 6.23, dct 6.38, householder 6.56,
-        hadamard 6.57, rand\_ortho 7.32, and haar diverged to NaN. Two
-        mechanisms explain the pattern. (a)~Scale spread: orthogonal maps
-        preserve total energy but not per-coordinate scale -- the Haar/DCT DC
-        coefficient is $\sqrt{T}\approx 8$ times the (non-zero) mean image
-        value, so coefficient sequences have per-position scales far outside
-        the $[-1,1]$ patch range, which destabilizes early training at fixed
-        lr (hence the uniform \texttt{grad\_clip} added for the reported
-        run). (b)~Locality: dense global mixing destroys the 2D-adjacency
-        structure that makes next-patch prediction easy, so fixed dense bases
-        (and random permutations) start far behind within a small budget.
-  \item The standout: \textbf{cayley} -- a \emph{learnable} rotation
-        initialized near the identity ($Q\approx I$ at init) -- is the only
-        variant competitive with the official ordering, WINNING without
-        clipping (2.507 vs 2.625) and finishing a close second with it
-        (2.528 vs 2.474). Householder with $k=16$ random reflections starts
-        far from identity and behaves like the fixed dense mixes.
-        Within this budget, initialization at (near-)identity matters more
-        than the transform family; whether the learned rotation overtakes the
-        fixed ordering with a longer budget is exactly what the GPU
-        \texttt{full}-profile rerun will test.
-  \item With clipping, haar recovers from NaN to 4.390 -- essentially tied
-        with identity\_only (4.403) and ahead of random\_perm -- while the
-        global-support bases (hartley/dct/hadamard, 6.2--6.6) stay far
-        behind. Haar's locality (most coefficients have small support)
-        appears to make it the least-damaged fixed basis, supporting the
-        locality mechanism above.
-  \item Designated follow-ups once the host GPU returns: the \texttt{full}
-        profile rerun of this exact command; learnable orthogonal transforms
-        initialized AT Haar/DCT (test whether structure + learnability
-        beats identity init); per-coefficient actnorm between blocks
-        (inserted as a proper flow layer with its logdet, not in the
-        permutation slot) to remove the scale-spread confound; and the same
-        ablation on CIFAR-10.
+        hadamard 6.57, rand\_ortho 7.32, and haar diverged to NaN.
+        \textbf{Correction:} an earlier version of this document attributed
+        that instability to \emph{scale spread}, on the grounds that the DC
+        coefficient is $\sqrt{T}\approx 8$ times the mean image value.
+        Direct measurement on the data does not support this as the
+        explanation for the \emph{ranking}. Pooled over 4000 test images,
+        the Haar DC coefficient's standard deviation is only $1.5\times$ the
+        median Haar coefficient's, and the Haar coefficient scales are in
+        fact \emph{more} uniform across positions than raw patch scales.
+        Scale spread remains a plausible account of the transient
+        optimization blow-ups (which occur in every variant, including a
+        $4.3\times10^{25}$ single-epoch spike in baseline\_flip at epoch~71
+        that \texttt{grad\_clip} absorbed without lasting harm), but it does
+        not explain which basis ends up ahead.
+  \item \textbf{What does explain the fixed-basis ordering: destruction of
+        exploitable sparsity, moderated by basis locality.} MNIST padded to
+        $32\times32$ is largely deterministic background. Fitting the best
+        \emph{diagonal} Gaussian in each basis (variance floored at the
+        run's actual uniform-dequantization noise) gives the cost a
+        factorized model would pay: raw patches $-2.464$ bits/dim with
+        37.9\% of the 1024 dimensions near-constant; 1D Haar over the token
+        sequence $-0.999$ with 17.6\%; 1D DCT/Hadamard/Hartley $+0.82$ to
+        $+0.84$ with \emph{zero} near-constant dimensions. The mechanism is
+        basis support: Haar basis vectors touch a median of 2 of the 64
+        sequence slots, so a wavelet lying entirely inside the background
+        still yields a constant coefficient, whereas every DCT and Hadamard
+        basis vector spans all 64 slots and mixes background with digit.
+        This proxy reproduces the measured ordering exactly, and predicts
+        deficits (haar $+1.46$, dense $+3.28$ to $+3.31$) about a third to
+        two-thirds larger than those observed --- as expected, since the
+        proxy assumes a factorized model while the AR conditioning recovers
+        some cross-coordinate structure. Note this is a penalty of
+        optimization and inductive bias, not of information: orthogonal maps
+        preserve differential entropy and $\mathcal{N}(0,I)$ is
+        rotation-invariant, so all variants are equally expressive in
+        principle.
+  \item \textbf{And for the permutation variants: variance in
+        autoregressive context coverage.} Counting, for each token, its
+        total number of AR predecessors summed over the four metablocks, all
+        three orderings give the same \emph{mean} (126) but different
+        spreads: identity/flip alternation gives exactly 126 to every token
+        (std 0) because the two orders are complementary by construction;
+        four independent random permutations give std 36.3 with a
+        worst-served token at 42; identity-only gives std 73.9 with token~0
+        receiving \emph{zero} context in all four blocks. Since bits/dim is
+        a sum over tokens and the cost of missing context is convex, the
+        starved tokens dominate. That std ordering ($0 < 36.3 < 73.9$)
+        reproduces the measured bpd ordering ($1.171 < 2.157 < 11.168$).
+        Positional embeddings are \emph{not} the mechanism: the official
+        implementation permutes the embedding table alongside the tokens, so
+        each token keeps its own embedding under any ordering.
+  \item \textbf{Experimental defect to fix before publication:}
+        \texttt{random\_perm} is the only non-control variant not wrapped in
+        the odd-block flip alternation that every other variant receives, so
+        its deficit conflates random ordering with missing directional
+        alternation. The clean version applies the \emph{same} permutation
+        $\sigma$ on even blocks and $\mathrm{flip}\circ\sigma$ on odd
+        blocks, which restores constant 126-token coverage while still
+        destroying spatial locality, isolating the variable of interest.
+  \item \textbf{cayley} -- a learnable rotation initialized near the
+        identity ($Q\approx I$) -- remains the strongest alternative to the
+        official ordering at 1.203 versus 1.171, and produces the cleanest
+        sample grid in the study. The claim that it \emph{beats} the
+        baseline does not survive: it won only in the unclipped 6-epoch run
+        (2.507 vs 2.625) and finishes a close second at both 6 and 120
+        epochs. The honest statement is that the official flip alternation
+        is not beaten by any of the nine alternatives tested here, and that
+        a near-identity-initialized learnable rotation matches it to within
+        0.032 bits/dim. Householder ($k=16$, initialized far from identity)
+        reaches 2.199 but costs $5\times$ the wall time (47.6 vs 9.4
+        minutes) because its \texttt{matrix()} applies 16 reflections
+        sequentially.
+  \item \textbf{Likelihood and sample quality come apart.} Three variants
+        produce entirely blank sample grids --- identity\_only (11.168),
+        rand\_ortho (3.122) and householder (2.199) --- yet the latter two
+        have competitive test likelihood, better than hartley (3.165), whose
+        grid shows clear digits. A blank grid means the reverse pass
+        saturated: every value clamped to the same bound. All three are
+        unstructured dense rotations or the degenerate control, while the
+        structured bases (Haar/DCT/Hadamard/Hartley) and the near-identity
+        cayley all sample cleanly. TarFlow's reverse is sequential, so
+        inversion error compounds across the chain; a good forward density
+        does not imply a usable sampler. \emph{Rendering caveat:} the grids
+        are written with \texttt{normalize=True} and no explicit
+        \texttt{value\_range}, so each is contrast-stretched by its own
+        min/max. Shape and texture are comparable across variants;
+        brightness and contrast are not. Both should be fixed by passing
+        \texttt{value\_range=(-1,1)} and by checkpointing weights so grids
+        can be re-rendered without retraining.
+  \item \textbf{The pixel-basis advantage is likely specific to MNIST.}
+        Repeating the diagonal-Gaussian analysis on CIFAR-10, which has no
+        deterministic background (zero near-constant dimensions in every
+        basis), inverts every sign: relative to raw pixels, 1D Haar scores
+        $-0.47$, full-image 2D Haar $-1.61$ and full-image 2D DCT $-2.17$
+        bits/dim --- i.e.\ on natural images the pixel basis is the
+        \emph{worst} of the four, not the best. Full-image 2D transforms
+        also beat the 1D token-sequence versions on both datasets (MNIST
+        $-0.75$, CIFAR $-1.15$), which supports the step-5 design. This is
+        an analysis of the data, not a trained result: it predicts that the
+        step-4 ranking will not transfer to CIFAR-10, and that prediction is
+        untested until the ablation is actually run there.
+  \item Designated follow-ups, in priority order: (i)~the same ablation on
+        CIFAR-10, which the analysis above predicts will invert the ranking
+        and is therefore the decisive test of whether any of this
+        generalizes; (ii)~step~5's full-image 2D feature domains at the
+        120-epoch budget, since they were only ever run at 6 CPU epochs ---
+        the budget now known to penalize exactly these transforms;
+        (iii)~learnable orthogonal transforms initialized AT the 2D Haar/DCT
+        basis, combining the structure that helps the fixed bases with the
+        adaptability that makes cayley competitive; (iv)~smoother wavelets
+        (CDF~9/7, Daubechies-4) with better energy compaction than Haar's
+        step functions; (v)~the corrected \texttt{random\_perm} variant
+        described above; and (vi)~per-coefficient actnorm between blocks
+        (as a proper flow layer with its logdet, not in the permutation
+        slot) to remove the scale-spread confound entirely.
 \end{itemize}
 
 \section{Step 5: Feature-domain blocks -- autoregression over 2D
@@ -555,10 +653,23 @@ coefficients}
 \subsection{Analysis}
 \label{sec:step5analysis}
 \begin{itemize}
-  \item Protocol sanity: pixels\_flip reproduces the step-4 baseline to the
-        fourth decimal (2.4736 vs 2.4736 val bpd) -- the two steps share the
-        protocol exactly, so numbers are directly comparable across both
-        ablations.
+  \item \textbf{Budget warning --- read before comparing to step~4.} Every
+        step-5 number in this section comes from the \texttt{reduced} CPU
+        profile (6 epochs, 12k subset), and every step-4 number quoted
+        \emph{within this section} is the corresponding step-4 reduced-profile
+        number, not the 120-epoch results tabulated in
+        \S\ref{sec:step4analysis}. The two are not comparable: at 120 epochs
+        step~4's haar improves from 4.390 to 1.608 and its dense bases from
+        6.2--7.3 to 2.78--3.17, so the step-5 conclusions below --- which
+        rest on those reduced-profile contrasts --- are provisional and may
+        reverse in the same way. Rerunning step~5 at the 120-epoch budget is
+        the top-priority follow-up; the transforms it studies are precisely
+        the slow-converging kind that the short budget penalizes.
+  \item Protocol sanity: pixels\_flip reproduces the step-4 baseline
+        \emph{at the matched reduced profile} to the fourth decimal (2.4736
+        vs 2.4736 val bpd) -- the two steps share the protocol exactly, so
+        numbers are directly comparable across both ablations whenever the
+        budget is matched.
   \item Headline: true 2D coarse-to-fine feature extraction closes most of
         the gap that step-4's 1D sequence mixing opened.
         \textbf{Alternating pixel- and coefficient-domain blocks is nearly

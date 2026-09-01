@@ -28,7 +28,7 @@ sample_nrow: 6      # 6x6 sample grid per variant
 
 budget:
   full:             # GPU profile (auto-selected when CUDA is available)
-    epochs: 12
+    epochs: 120
     train_subset: 0       # 0 = all 54k
     val_subset: 4000
     test_subset: 10000

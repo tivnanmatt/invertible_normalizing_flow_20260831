@@ -3,6 +3,10 @@
 # tarflow_repo: clone of the OFFICIAL github.com/apple/ml-tarflow (model code
 # imported unmodified; commit recorded in outputs provenance).
 
+# GPU POLICY (2026-09-01): GPU0 ONLY. GPU1 failed 2026-08-31 and, though it
+# enumerates again after the reboot, we do not use it. The recon-dev container
+# is pinned to GPU0 (compose device_ids + CUDA_VISIBLE_DEVICES=0), so cuda:0 is
+# the only valid device here; runs are sequential rather than one-per-GPU.
 seed: 20260831
 tarflow_repo: /dev_ws/ml-tarflow
 output_root: outputs/step2_tarflow
@@ -42,7 +46,7 @@ runs:
   # 8x A100, reaches 2.99 bpd; classic CIFAR-10 flows: RealNVP 3.49,
   # Glow 3.35, Flow++ 3.08 bpd.
   cifar10_uniform:
-    device: cuda:1
+    device: cuda:0
     dataset: cifar10
     conditional: false
     img_size: 32

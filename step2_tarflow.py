@@ -29,7 +29,7 @@ Outputs (outputs/step2_tarflow/):
 
 Usage:
   python step2_tarflow.py                          # all runs, sequentially
-  python step2_tarflow.py --runs mnist_toy         # one run (e.g. per GPU)
+  python step2_tarflow.py --runs mnist_toy         # a single run
   python step2_tarflow.py --collect                # rebuild summary/fragments
 """
 
@@ -422,7 +422,7 @@ def main(argv=None):
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
     ap.add_argument("--runs", nargs="*", default=None,
                     help="subset of runs (default: all in config)")
-    ap.add_argument("--device", default=None, help="override run device, e.g. cuda:1")
+    ap.add_argument("--device", default=None, help="override run device (GPU0-only policy: cuda:0)")
     ap.add_argument("--collect", action="store_true",
                     help="only rebuild summary/latex fragments from existing results")
     args = ap.parse_args(argv)

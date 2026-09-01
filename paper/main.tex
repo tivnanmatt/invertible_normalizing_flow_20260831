@@ -774,19 +774,40 @@ coefficients}
 \label{sec:step6analysis}
 \begin{itemize}
   \item \textbf{The construction is exactly as designed, and it does not
-        help.} On CIFAR-10 at 120 epochs the official ordering wins:
-        \texttt{baseline\_flip} 3.683 test bpd versus \texttt{haar\_alt}
-        3.814, with \texttt{haar\_pure} further behind. Making token 0 a
-        thumbnail of the whole image, and running the autoregression
-        coarse-to-fine, costs about 0.13 bits/dim rather than saving any. The
-        result is reported as measured; the ranking table above is the
-        primary readout.
+        help.} On CIFAR-10 at 120 epochs the official ordering wins, and the
+        penalty scales monotonically with how much of the stack runs in the
+        Haar domain: \texttt{baseline\_flip} (0 Haar blocks) 3.683 test bpd,
+        \texttt{haar\_alt} (2 Haar blocks) 3.814, \texttt{haar\_pure}
+        (4 Haar blocks) 4.054. Making token 0 a thumbnail of the whole image
+        and running the autoregression coarse-to-fine costs 0.13 bits/dim at
+        half strength and 0.37 at full strength, rather than saving any. The
+        dose-response is the strongest part of the evidence: it is a
+        monotone trend in the one quantity that was varied, not a single
+        comparison that might be noise. Reported as measured.
   \item \textbf{It is also not free in wall time}, despite $T$ being
-        unchanged: 18.9 minutes versus 12.6 for the baseline, because the
-        fold / 3-level DWT / unfold runs inside every Haar block on every
-        forward and backward pass. The FLOP count of the transform is
+        unchanged: 18.9 and 17.8 minutes versus 12.6 for the baseline,
+        because the fold / 3-level DWT / unfold runs inside every Haar block
+        on every forward and backward pass. The FLOP count of the transform is
         negligible; the cost is memory traffic and kernel launches on small
         tensors.
+  \item \textbf{The Haar domain also destabilises the reverse pass, and the
+        two failure modes are different.} With the sampler now using an
+        explicit \texttt{value\_range}, the grids are directly comparable, and
+        \texttt{haar\_alt} collapses \textbf{20 of its 36 sample cells (56\%)}
+        to fully saturated black, while \texttt{baseline\_flip} and
+        \texttt{haar\_pure} collapse none. This mirrors step 4, where
+        \texttt{rand\_ortho} and \texttt{householder} produced blank grids at
+        competitive likelihood: a good forward density does not imply a usable
+        sampler, and here the instability afflicts the \emph{alternating}
+        stack specifically -- the one that repeatedly switches domain -- and
+        not the homogeneous all-Haar stack. Each domain switch is another
+        inverse transform in the sequential reverse chain, and errors compound
+        across them.
+  \item \texttt{haar\_pure} fails differently and more legibly: its samples
+        are intact but carry pronounced blocky, checkerboard artifacts at the
+        patch scale -- the Haar coefficient blocks showing through directly,
+        since with every block in the coefficient domain the autoregression
+        never gets a pixel-domain pass to smooth across patch boundaries.
   \item \textbf{Why this is consistent with step 4 rather than surprising.}
         \S\ref{sec:step4analysis} found that the fixed-basis ordering is
         governed by how much exploitable sparsity a basis preserves, and that

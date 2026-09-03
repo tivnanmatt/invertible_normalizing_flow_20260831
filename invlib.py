@@ -32,6 +32,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
 
 # ==========================================================================
@@ -571,6 +572,76 @@ def condition_on_image(model, cond_channels, bound=None):
         mask[T:, T:] = torch.tril(torch.ones(T, T, device=dev))   # and causally each other
         blk.register_buffer("cond_attn_mask", mask)
     return model
+
+
+# --------------------------------------------------------------------------
+# Differentiable sampling direction for TarFlow
+# --------------------------------------------------------------------------
+
+def _block_reverse_differentiable(blk, z, attn_temp=1.0):
+    """One MetaBlock, sampling direction, with autograd intact.
+
+    The official MetaBlock.reverse writes each recovered token into the input
+    tensor in place (`x[:, i+1] = ...`); autograd rejects that because the
+    tensor was already consumed by `proj_in`. This loop keeps the recovered
+    tokens in a list instead and calls the official (or re-classed)
+    `reverse_step` for the coupling parameters, one token at a time with the
+    official KV cache. Returns the recovered tokens and, per example, the sum
+    of the log-scales `za` it applied -- so that
+        log q(x) = log N(z) - sum_blocks sum(za)
+    which is the official forward log-density evaluated at x.
+    """
+    x = blk.permutation(z)
+    pos_embed = blk.permutation(blk.pos_embed, dim=0)
+    blk.set_sample_mode(True)
+    try:
+        toks = [x[:, 0]]                          # token 0: xa = xb = 0 in the official model
+        sum_za = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+        for i in range(x.size(1) - 1):
+            # reverse_step slices x[:, i:i+1] and pos_embed[i:i+1]; feed it the
+            # current token alone and the shifted table so the official code
+            # (and any re-classed subclass) runs unchanged
+            za, zb = blk.reverse_step(toks[i].unsqueeze(1), pos_embed[i:], 0, None, attn_temp, "cond")
+            scale = za[:, 0].float().exp().type(za.dtype)
+            toks.append(x[:, i + 1] * scale + zb[:, 0])
+            sum_za = sum_za + za[:, 0].flatten(1).sum(-1)
+    finally:
+        blk.set_sample_mode(False)                # always leave the block in parallel mode
+    return blk.permutation(torch.stack(toks, dim=1), inverse=True), sum_za
+
+
+def differentiable_reverse(model, z, checkpoint=True, attn_temp=1.0):
+    """x = f^{-1}(z) through every block of a TarFlow `model`, differentiable
+    w.r.t. z and the parameters.
+
+    Returns (x, log_q) with x the image (B, C, H, W) and log_q = log N(z) -
+    sum_blocks sum(za) the model's log-density at x in nats per image -- the
+    same quantity the official forward pass gives, obtained for free from the
+    sampling pass (verified by step 10's self-test). Memory: each block's
+    KV cache is O(T^2 C) per layer; with `checkpoint` a block's activations
+    are recomputed in the backward pass so only one block is live at a time
+    (the re-entrant checkpoint: the non-re-entrant one stops the recompute
+    early with an exception, which leaves the blocks in sample mode with
+    their caches full -- both a leak and a correctness hazard for the next
+    parallel forward pass). The re-entrant checkpoint needs an input that
+    requires grad and works with `.backward()`, not `torch.autograd.grad`.
+    Only the unconditional model (`y = None`) and unit `var` are supported.
+    """
+    if not bool(torch.all(model.var == 1)):
+        raise NotImplementedError("differentiable_reverse assumes the nvp unit base variance")
+    log_q = -0.5 * (z ** 2 + math.log(2 * math.pi)).flatten(1).sum(-1)
+    use_ckpt = checkpoint and torch.is_grad_enabled()
+    x = z
+    if use_ckpt and not x.requires_grad:
+        x = x.detach().requires_grad_(True)
+    for blk in reversed(model.blocks):
+        if use_ckpt:
+            x, sum_za = torch.utils.checkpoint.checkpoint(
+                _block_reverse_differentiable, blk, x, attn_temp, use_reentrant=True)
+        else:
+            x, sum_za = _block_reverse_differentiable(blk, x, attn_temp)
+        log_q = log_q - sum_za
+    return model.unpatchify(x), log_q
 
 
 # ==========================================================================

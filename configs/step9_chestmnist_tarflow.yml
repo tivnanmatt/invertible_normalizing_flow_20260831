@@ -1,0 +1,56 @@
+# Config for step9_chestmnist_tarflow.py -- unconditional TarFlow prior on
+# ChestMNIST at 64 x 64.
+#
+# This is the PRIOR for step 10 (variational posterior fine-tuning), so it is
+# a likelihood model: uniform dequantization, fp32, official bits/dim.
+#
+# Capacity. The TarFlow paper's 64-resolution likelihood model (ImageNet64)
+# is [patch 2, 768 channels, 8 blocks, 8 layers/block] trained on 16 A100s in
+# fp32. On the single RTX 4090 available here that exact model does not fit
+# (fp32 training OOMs at batch 8 with T = 1024 tokens). We keep the paper's
+# WIDTH and DEPTH (768 x 8 x 8, 455M parameters) and use patch 8, i.e. T = 64
+# tokens of 64 pixels each: 7 min/epoch at batch 64. This is an honest
+# trade-off, not a replication: fewer, larger tokens coarsen the autoregressive
+# factorisation (TarFlow's own ablations show smaller patches give better
+# bpd). Patch 8 also keeps the step-10 sequential reverse pass -- 63 KV-cached
+# steps per block, differentiated -- tractable in memory (O(T^2) cache).
+
+seed: 20260903
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step9_chestmnist_tarflow
+
+dataset: medmnist_chestmnist   # 78,468 / 11,219 / 22,433 train/val/test, grayscale
+medmnist_size: 64
+img_size: 64
+channel_size: 1
+patch_size: 8                  # T = 64 tokens of dimension 64
+noise_type: uniform            # 8-bit uniform dequantization -> bpd is a data likelihood
+hflip: false                   # chest radiographs are not left/right symmetric
+
+model:                         # paper's 64-res width and depth
+  channels: 768
+  blocks: 8
+  layers_per_block: 8
+
+# Soft log-scale bound (invlib.bound_log_scale, +-8 nats per block). Step 8
+# measured it to be free in bpd and it keeps every SAMPLE finite, which the
+# step-10 reverse pass (exp(za) chained over 8 blocks, differentiated) needs.
+scale_bound: 8.0
+
+train:
+  epochs: 40
+  batch: 64
+  lr: 1.0e-4                   # official ImageNet64 setting
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  eval_every: 1                # val bpd every epoch (11k images, ~20 s)
+  early_stop_patience: 4       # stop once val bpd has not improved for 4 epochs
+                               # (the cosine schedule stays planned for `epochs`;
+                               # the checkpoint used downstream is the best-val one)
+  sample_every: 2              # sample grid every N epochs
+  sample_nrow: 8
+  sample_rows: 8
+  test_subset: 0               # 0 = full test set (22,433 images)
+
+# Memorisation check on the final samples: nearest training image in L2.
+nn_check_samples: 16

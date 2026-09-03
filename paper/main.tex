@@ -159,6 +159,7 @@ datasets).
 \end{itemize}
 
 \section{Step 2: TarFlow -- Transformer Autoregressive Flow}
+\label{sec:step2}
 
 \subsection{Methods}
 \begin{itemize}
@@ -1702,6 +1703,563 @@ zeros.}
         shown in the figures but not quantified.
 \end{itemize}
 
+\section{Step 9: An unconditional TarFlow prior on ChestMNIST $64 \times 64$}
+\label{sec:step9}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step9\_chestmnist\_tarflow.py} (+ \texttt{step1\_datasets},
+        \texttt{step2\_tarflow}, \texttt{invlib.bound\_log\_scale}); config:
+        \texttt{configs/step9\_chestmnist\_tarflow.yml}; outputs:
+        \texttt{outputs/step9\_chestmnist\_tarflow/\{data,figures\}/}.
+  \item \textbf{Why.} Steps 7--8 solved inverse problems by training a flow
+        \emph{for} the measurement system. Step 10 does the opposite, after
+        Feng et al.\ (ICCV 2023, arXiv:2304.11751): one generative model of the images,
+        trained once with no measurement in sight, is used as a principled
+        Bayesian prior, and the posterior for a single measurement is
+        obtained afterwards by variational inference. This step trains that
+        prior. The data are the 64-resolution release of MedMNIST
+        ChestMNIST (78{,}468 / 11{,}219 / 22{,}433 frontal chest radiographs,
+        official splits, the 14 disease labels unused), chosen because
+        radiographs have global structure --- mediastinum, rib cage, lung
+        fields --- that a $24 \times 24$ hole in the middle must be filled
+        consistently with.
+  \item \textbf{Model and recipe.} The official \texttt{apple/ml-tarflow}
+        model (unmodified, imported from the pinned commit) trained as a
+        likelihood model with the official ImageNet64 recipe: uniform
+        dequantization, float32, AdamW$(0.9, 0.95)$ with weight decay
+        $10^{-4}$, peak learning rate $10^{-4}$, cosine decay to $10^{-6}$
+        after a one-epoch warm-up, gradient-norm clipping at 1, batch 64,
+        the official bits/dim (\S\ref{sec:step2}). No horizontal flip: a
+        chest radiograph is not left--right symmetric (the heart is on the
+        viewer's right). Width and depth are the paper's 64-resolution
+        setting, 768 channels, 8 blocks of 8 layers (455.2M parameters), and
+        the coupling head is bounded ($8\tanh(x_a/8)$, \texttt{scale\_bound
+        8}) because step 10 must push arbitrary latents through the
+        \emph{inverse} of this model for thousands of steps and the bound was
+        free in bits/dim in step 8.
+  \item \textbf{The one deliberate deviation: patch size 8, not 2.} The
+        official 64-resolution likelihood config uses patch 2 ($T = 1024$
+        tokens) on 16 GPUs. On the single 24 GB GPU available here that
+        model does not fit at batch 8; patch 4 ($T = 256$) fits only at
+        reduced width or depth (768-8-8 out of memory at batch 32; 512-8-8
+        at batch 64; 512-8-4 = 102M parameters, 7.1 min/epoch at 17.9 GB).
+        Patch 8 ($T = 64$ tokens of 64 pixels) keeps the paper's width and
+        depth at 7.0 min/epoch and 19.1 GB peak at batch 64, and it is also
+        what makes step 10 tractable: the sequential inverse costs $T$
+        cached attention steps per block with an $O(T^2)$ key--value cache,
+        and it has to be differentiated through. The trade-off is coarser
+        autoregression (each token predicts a $8 \times 8$ patch given the
+        previous ones, with the intra-patch dependence carried only by the
+        affine coupling), and it is recorded in the config header rather
+        than hidden. The planned budget is a 40-epoch cosine schedule
+        ($49{,}040$ steps, $\approx 5$ hours) with a validation early-stop:
+        training halts once the validation bits/dim has not improved for
+        four consecutive epochs (\texttt{early\_stop\_patience 4}); the
+        learning-rate schedule is \emph{not} re-planned when this happens,
+        so a stopped run is a truncation of the nominal one, and the
+        checkpoint used downstream is the best-validation one in either
+        case. In the interest of honesty: the rule was written into the
+        script during the run, at epoch 21, after the validation bits/dim
+        had risen for three consecutive epochs; the running process was
+        then stopped after the epoch-22 checkpoint and resumed under the
+        rule (resuming re-applies it to the stored validation history, so
+        the same rule started from scratch would stop at the same epoch).
+  \item \textbf{What is measured.} Validation bits/dim every epoch and
+        \texttt{model\_best.pth} at the best epoch; test bits/dim of the
+        final and of the best-validation checkpoint, recorded per image
+        (\texttt{test\_bpd\_per\_image\_*.npy}) so that the mean, the median,
+        the number of images above 10 bits/dim and the mean without them are
+        all available, together with the worst test image and the maximum
+        $|z|$ after each block on it (the per-image accounting was added
+        after the first final evaluation returned a test mean of
+        $10^{24}$; see the analysis); sample grids from fixed noise every
+        two epochs; non-finite and out-of-range statistics of the final
+        samples; and a memorisation check --- the $L_2$ nearest training
+        image of each of 16 final samples, compared with the
+        nearest-training-image distance of 256 held-out validation images.
+        A prior that reproduces training images would make step 10's
+        posterior samples look good for the wrong reason.
+  \item \textbf{The falsifiable claims.} (i) Validation bits/dim decreases
+        monotonically up to fluctuation and the test value of the best
+        checkpoint sits within a few hundredths of it (no over-fitting at
+        this data size). (ii) Samples are finite and in range, and are
+        radiographs --- a mediastinum between two lung fields with ribs ---
+        not texture. (iii) Samples' nearest-training-image distance is at
+        or above the validation images' own, i.e.\ the model is not
+        memorising.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step9_chestmnist_tarflow.yml}}
+
+\subsection{Results}
+\InputIfFileExists{../outputs/step9_chestmnist_tarflow/data/summary.tex}{}
+  {\emph{not generated yet -- run \texttt{python step9\_chestmnist\_tarflow.py}.}}
+
+\IfFileExists{../outputs/step9_chestmnist_tarflow/figures/curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step9_chestmnist_tarflow/figures/curves.png}
+\caption{Step 9 training: mean training loss per epoch (nats/dim, the
+official $\tfrac12\bar{z}^2 - \overline{\log\det}$), validation bits/dim per
+epoch, and mean pre-clip gradient norm.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step9_chestmnist_tarflow/figures/real_grid.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.42\textwidth]{outputs/step9_chestmnist_tarflow/figures/real_grid.png}\hfill
+\includegraphics[width=0.42\textwidth]{outputs/step9_chestmnist_tarflow/figures/final_samples.png}
+\caption{Left: 64 training radiographs (ChestMNIST-64). Right: 64 samples
+from the best-validation checkpoint, fixed noise, clamped to $[-1,1]$ for
+display.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step9_chestmnist_tarflow/figures/nearest_neighbours.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step9_chestmnist_tarflow/figures/nearest_neighbours.png}
+\caption{Memorisation check: 16 samples (top) and the $L_2$-nearest of the
+78{,}468 training images (bottom, RMS distance on the $[-1,1]$ scale), with
+the same statistic for held-out validation images in the title.}
+\label{fig:step9nn}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step9analysis}
+The claims, in order.
+
+\begin{itemize}
+  \item \textbf{(i) is falsified in its second half, and the recipe was
+        changed because of it.} Validation bits/dim fell monotonically from
+        4.178 (epoch 1) to 3.024 at epoch 18 and then rose for four
+        consecutive epochs (3.029, 3.031, 3.036, 3.044) while the training
+        loss kept falling at an unchanged rate ($-3.779 \to -3.834$
+        nats/dim) and the learning rate was still at $0.6 \to 0.45$ of its
+        peak. That is over-fitting, at 78k training images and 455M
+        parameters, and it is why the early-stop rule now in the config
+        exists; the run was truncated at epoch 22 of 40 and the
+        best-validation checkpoint (epoch 18) is the prior for step 10. The
+        first half of (i) holds where it can be checked: on the 22,432 test
+        images that do not blow up, the best checkpoint's mean is 3.0251
+        bits/dim against 3.0244 on validation (median 3.050 vs.\ 3.048), and
+        the final checkpoint is 0.020 bits/dim worse on test, in line with
+        its validation deficit.
+  \item \textbf{A single test image breaks the likelihood, and the mean
+        test bits/dim is therefore meaningless as reported by the official
+        recipe.} Test image 14583 (Figure~\ref{fig:step9worst}) has bits/dim
+        $8 \times 10^{28}$ under the best checkpoint ($4 \times 10^{25}$
+        under the final one), so the plain test mean is $3.6 \times
+        10^{24}$. The mechanism is visible in the per-block maximum $|z|$:
+        3.2, 51, 235, $2 \times 10^{3}$, $10^{6}$, $10^{9}$, $4 \times
+        10^{12}$, $10^{16}$ --- from block 4 on it grows by $\approx e^{8}$
+        per block, which is exactly the scale bound saturating: at one
+        token (raster index 39, the right-edge patch of the fifth patch
+        row, rows 32--39 of the image) every block predicts a tiny scale
+        with high confidence and the residual is amplified by $e^{8}$ each
+        time. That patch is the dark right border of the film (values
+        10--30) with a two-pixel bright speck in it (values 165--214 at
+        rows 38--39, columns 62--63), a marker or a defect --- an outlier
+        of a few pixels, at a position where the model, having seen
+        thirty-nine patches of an ordinary radiograph, predicts the border
+        with confidence. The
+        blow-up survives a change of dequantization noise seed (five seeds:
+        $3$--$13 \times 10^{28}$), no noise at all, and Gaussian pixel noise
+        of 0.02, but not a horizontal flip (4.1 bits/dim) or a one-pixel
+        shift (4.5): it is a property of that content at that causal
+        position, not of an unlucky noise draw. No training image (78,468;
+        max 4.88) and no validation image (11,219; max 4.70) does this,
+        which is why nothing in the training log warned of it. The
+        \texttt{scale\_bound 8} that step 8 found ``free'' is what makes the
+        failure finite instead of \texttt{inf}; a smaller bound would cap
+        the damage at the cost of expressiveness and was not retrained
+        here. For the purposes of this document the honest test number is
+        the one over the images below 10 bits/dim, stated as such, with the
+        count (one) alongside.
+  \item \textbf{(ii) holds.} All 64 final samples are finite, 0.29\% of
+        pixels fall outside $[-1,1]$ before clamping, and every sample in
+        the grid is a frontal chest radiograph with two lung fields, a
+        mediastinum, a diaphragm and rib texture; the failure modes are the
+        ones the data has (over-exposed, rotated, and cropped studies), not
+        texture or tiling artefacts, and no $8 \times 8$ patch grid is
+        visible despite the patch-8 tokenisation.
+  \item \textbf{(iii) holds.} The 16 samples' nearest training images are
+        at RMS distance 0.187 (range 0.133--0.253), the validation images'
+        own nearest-training distance is $0.190 \pm 0.045$ (minimum 0.078),
+        and the nearest neighbours in Figure~\ref{fig:step9nn} share pose
+        and exposure with the samples but differ in anatomy. The model is
+        not memorising at 22 epochs, even though it had started to
+        over-fit in likelihood.
+\end{itemize}
+
+\IfFileExists{../outputs/step9_chestmnist_tarflow/figures/test_worst_image_best.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.18\textwidth]{outputs/step9_chestmnist_tarflow/figures/test_worst_image_best.png}
+\caption{Test image 14583 (with the dequantization noise used in the
+evaluation), the one image of 22,433 on which the step-9 flow blows up: the
+per-block maximum $|z|$ grows by $\approx e^{8}$ per block from block 4 at
+the token covering the right-border patch of the fifth patch row, which
+contains a two-pixel bright speck.}
+\label{fig:step9worst}
+\end{figure}}{}
+
+
+\section{Step 10: Variational posterior by fine-tuning the prior (Feng et al.)}
+\label{sec:step10}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step10\_variational\_posterior.py} +
+        \texttt{invlib.differentiable\_reverse} + \texttt{measlib.InpaintBox};
+        config: \texttt{configs/step10\_variational\_posterior.yml}; outputs:
+        \texttt{outputs/step10\_variational\_posterior/\{data,figures\}/}.
+  \item \textbf{The method being reproduced.} Feng, Smith, Dou, Bouman and
+        Freeman (``Score-Based Diffusion Models as Principled
+        Priors for Inverse Imaging'', ICCV 2023, arXiv:2304.11751) take a generative model
+        trained on clean images as the prior $p_\theta(x)$, a known
+        measurement model $p(y|x)$, and fit a normalizing flow $q_\phi$ to
+        the posterior of \emph{one} measurement $y$ by minimising the reverse
+        Kullback--Leibler divergence,
+        \[
+          \phi^{*} = \arg\min_{\phi}\;
+          \mathbb{E}_{x \sim q_\phi}\!\left[ -\log p(y|x) - \log p_\theta(x)
+          + \log q_\phi(x) \right],
+        \]
+        estimated with Monte-Carlo batches of samples $x = g_\phi(z)$,
+        $z \sim \mathcal{N}(0, I)$, so that gradients flow through the
+        sampler. The objective equals $\mathrm{KL}(q_\phi \,\|\, p(x|y)) -
+        \log p(y)$: it is a negative evidence lower bound, an upper bound on
+        $-\log p(y)$ that is tight exactly when $q_\phi$ is the posterior.
+        There are no weights to tune (their earlier ``deep probabilistic
+        imaging'' needed an entropy weight; here the three terms are the
+        posterior). In the paper the prior is a score-based diffusion model
+        whose $\log p_\theta(x)$ is a probability-flow ODE, $q_\phi$ is a
+        RealNVP of 64 affine couplings trained from scratch with 64 samples
+        per step, Adam at $2 \times 10^{-4}$ with gradient-norm clipping at
+        1, converging in 5k--10k steps; samples with any $|{\rm pixel}| > 2$
+        are discarded as outliers before computing mean, standard deviation,
+        PSNR and SSIM over 128 posterior samples. They also report that an
+        NF prior with this procedure was unstable at $10^{-5}$ and remark
+        that a ``clever initialization might make DPI optimization more
+        stable with an NF prior''.
+  \item \textbf{The adaptation.} Three substitutions, all of them the
+        natural ones for an exact-likelihood flow prior. (1) $p_\theta$ is the
+        step-9 TarFlow, so $-\log p_\theta(x) = -\log\mathcal{N}(f_\theta(x))
+        - D\,\overline{\log s}_\theta(x)$ is one parallel forward pass, exact,
+        no ODE. (2) $q_\phi$ has the prior's architecture and is
+        \emph{initialised at the prior's weights}: at step 0, $q_\phi =
+        p_\theta$, the reverse KL is $\mathbb{E}_{p_\theta}[-\log p(y|x)]$,
+        and the fit is a fine-tuning of the unconditional model into the
+        posterior of this one measurement --- the ``clever initialization''
+        of the remark, made obvious by the two models sharing a class.
+        (3) Samples and their log-density come from one pass:
+        $x = g_\phi(z)$ is TarFlow's sequential inverse, and since the model
+        is a flow, $\log q_\phi(x) = \log\mathcal{N}(z) - \sum_{\rm blocks}
+        \sum_{t,d} x_a$ is available from the scales that inverse already
+        computes, so no forward pass through $q_\phi$ is needed (the paper's
+        footnote notes $\log q$ is only needed during fitting). Because
+        $\log\mathcal{N}(z)$ does not depend on $\phi$, the gradient is that
+        of $\|M(x-y)\|^2/2\sigma^2 - \log p_\theta(x) - \sum x_a$; the
+        constant is kept so that the reported value is the negative ELBO.
+  \item \textbf{A differentiable TarFlow inverse
+        (\texttt{invlib.differentiable\_reverse}).} The official
+        \texttt{MetaBlock.reverse} writes each recovered token into the
+        input tensor in place (\texttt{x[:, i+1] = x[:, i+1]$\cdot e^{z_a}$
+        + $z_b$}), which autograd rejects, and it discards $z_a$. The
+        replacement runs the official \texttt{reverse\_step} (permutation,
+        positional embedding, the KV-cached causal attention blocks and the
+        shift-by-one are all the official code) but collects the tokens in a
+        list, stacks them, and accumulates $\sum z_a$; the official
+        \texttt{Model.reverse} is not called and \texttt{ml-tarflow} is not
+        modified. The memory problem is the cache: a block's inverse holds
+        $T$ steps of keys and values for 8 layers, about 122 MB per sample
+        per block in float32, so an 8-block graph at batch 32 would need 31
+        GB. Each block is therefore wrapped in re-entrant activation
+        checkpointing (\texttt{torch.utils.checkpoint}, \texttt{use\_reentrant=True}):
+        only the block boundaries are stored in the forward pass and each
+        block's cache is rebuilt during the backward pass, one block at a
+        time. The non-re-entrant variant cannot be used: its early-stop
+        exception skips \texttt{set\_sample\_mode(False)} and leaves every
+        attention module in sampling mode with a full cache, which leaked
+        0.9 GB per sample and corrupted the next parallel forward pass in
+        testing. The block function always restores parallel mode in a
+        \texttt{finally}.
+  \item \textbf{Verification of the inverse (\texttt{scratch/test\_diff\_reverse.py},
+        and \texttt{verify.json} on the real prior at the start of every
+        run).} On random 4-block models with perturbed couplings, with and
+        without the bound, in float32: (1) $x$ agrees with the official
+        \texttt{Model.reverse} to $0.0$ (bit-identical --- the same kernels
+        in the same order); (2) $\log q(x)$ from the reverse agrees with the
+        forward log-density $\log\mathcal{N}(f(x)) + D\,\overline{\log s}$
+        to $1.2$--$2.4 \times 10^{-4}$ on values of magnitude 1500;
+        (3) gradients with and without checkpointing are identical over
+        all 117 parameter tensors and are finite; (4) no attention module is
+        left in sampling mode; (5) on a two-block $16 \times 16$ model,
+        autograd derivatives of a pixel and of $\log q/100$ with respect to
+        four latent entries agree with central differences to
+        $1.8 \times 10^{-5}$. Cost for the step-9 model (768-8-8, patch 8):
+        forward + backward through the inverse takes 3.6 s for any batch
+        from 8 to 32 (the sequential loop is launch-bound, $8 \times 63$
+        cached steps of 8 layers), at 4.7 / 5.6 / 7.4 GB peak including the
+        1.8 GB of weights and 1.8 GB of gradients.
+  \item \textbf{The inverse problem.} One radiograph of the ChestMNIST-64
+        test split, its index drawn once from the seed (\texttt{test\_index:
+        null}) and recorded, so the image is not chosen by hand. The
+        measurement is \texttt{inpaint\_box} with a centred $24 \times 24$
+        hole (576 of 4096 pixels unobserved) and Gaussian noise $\sigma =
+        0.05$ on the observed pixels on the $[-1,1]$ scale (2.5\% of the
+        range; half of step 8's $\sigma$ on this scale), $y = M(x^{*} +
+        \sigma\epsilon)$, so $-\log p(y|x) = \|M(x-y)\|^2/2\sigma^2 +
+        \tfrac{n_{\rm obs}}{2}\log 2\pi\sigma^2$.
+  \item \textbf{Fitting.} Adam$(0.9, 0.99)$ at $10^{-5}$ (the paper's
+        NF-prior learning rate), gradient-norm clipping at 1, 32 Monte-Carlo
+        samples per step (the paper's 64 does not fit next to the prior's
+        activations; 32 costs the same time as 16 because the inverse is
+        launch-bound), 2000 steps. Steps whose loss or gradient is
+        non-finite are skipped and counted. Every 100 steps 64 posterior
+        samples are drawn from a fixed set of latents (through the official
+        in-place reverse, no gradients) and their mean, standard deviation,
+        PSNR/SSIM against the truth (on $[0,1]$, whole image and hole only),
+        and the paper's outlier count are logged, so the trajectory of the
+        posterior is visible, not only its end point.
+  \item \textbf{Evaluation, after the paper.} 128 posterior samples from
+        fresh latents, the $|{\rm pixel}| > 2$ outlier rule applied and
+        counted, mean and standard deviation maps, PSNR and SSIM of the
+        posterior mean, against two references on the same footing: the
+        zero-filled measurement (the pseudo-inverse $A^{+}y$) and the
+        \emph{prior} pushed through the same 128 latents (what $q_\phi$ was
+        at step 0). Two checks the paper does not report but that a
+        Bayesian posterior must pass: on the observed pixels the posterior
+        standard deviation should be at or below the noise $\sigma$, and in
+        the hole the standardised truth $(x^{*} - \mu)/s$ should look like
+        $\mathcal{N}(0, 1)$ --- its mean (a bias of the posterior mean),
+        its RMS and the fractions within $\pm 1$ and $\pm 2$ are reported
+        (0.68 / 0.95 if calibrated), with a histogram and a per-pixel
+        spread-versus-error plot. The mean was added to the report after
+        the run, when the histogram turned out to be shifted; it is
+        recomputed from the saved samples by \texttt{--collect}, which
+        also regenerates the calibration figure.
+  \item \textbf{The latent random walk.} $z_{t+1} = \cos\alpha\, z_t +
+        \sin\alpha\, \epsilon_t$ with $\alpha = 0.08$ rad per frame keeps
+        every $z_t$ exactly $\mathcal{N}(0, I)$ (so every frame is a posterior
+        sample) with correlation $\cos^k\alpha$ between frames $k$ apart
+        ($0.5$ at $k \approx 216$, 7 s at 30 fps). 600 frames are pushed
+        through both $g_\theta$ (the prior) and $g_\phi$ (the posterior) and
+        written as \texttt{walk.mp4} (H.264, four panels: measurement, prior
+        sample, posterior sample, truth); eight frames are shown as a strip
+        in this document.
+  \item \textbf{The falsifiable claims.} (i) The negative ELBO decreases and
+        the data term $-\log p(y|x)$ falls to about the value of a residual
+        at the noise level, $n_{\rm obs}/2 + \tfrac{n_{\rm obs}}{2}\log
+        2\pi\sigma^2 = 1760 - 7310 = -5550$ nats for $n_{\rm obs} = 3520$;
+        if it stalls far above, the flow could not reach the posterior.
+        (ii) Posterior samples
+        reproduce the observed pixels to within $\sigma$ and fill the hole
+        with anatomy that continues the observed ribs and mediastinum, with
+        visible variation between samples. (iii) Posterior-mean PSNR in the
+        hole exceeds both the zero-fill and the prior on the same latents.
+        (iv) The posterior standard deviation is small on observed pixels
+        and larger in the hole. (v) The standardised truth in the hole has
+        RMS near 1; a value $\gg 1$ means an over-confident $q_\phi$ (the
+        known failure mode of reverse KL, mode seeking), $\ll 1$ an
+        under-confident one. (vi) Few or no outliers by the paper's rule.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step10_variational_posterior.yml}}
+
+\subsection{Results}
+\InputIfFileExists{../outputs/step10_variational_posterior/data/summary.tex}{}
+  {\emph{not generated yet -- run \texttt{python step10\_variational\_posterior.py}.}}
+
+\IfFileExists{../outputs/step10_variational_posterior/figures/problem.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.75\textwidth]{outputs/step10_variational_posterior/figures/problem.png}
+\caption{The one inverse problem: the test radiograph, the mask, and the
+measurement $y$ (hole tinted red).}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step10_variational_posterior/figures/curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step10_variational_posterior/figures/curves.png}
+\caption{Fitting the posterior flow. Top: negative ELBO per step (light:
+raw, dark: 25-step running mean) and its first two terms; bottom:
+$\log q_\phi(x)$, PSNR of the posterior mean of 64 fixed-noise samples
+(whole image and hole, dashed: zero-fill in the hole), and the posterior
+standard deviation on hole and observed pixels against the noise $\sigma$.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step10_variational_posterior/figures/posterior_summary.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step10_variational_posterior/figures/posterior_summary.png}
+\caption{Final posterior (128 samples, outliers removed). Top: truth,
+measurement, posterior mean, posterior standard deviation, $|{\rm mean} -
+{\rm truth}|$; bottom: eight posterior samples $g_\phi(z)$.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step10_variational_posterior/figures/posterior_samples.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.85\textwidth]{outputs/step10_variational_posterior/figures/posterior_samples.png}
+\caption{32 posterior samples.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step10_variational_posterior/figures/prior_vs_posterior.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step10_variational_posterior/figures/prior_vs_posterior.png}
+\caption{The same eight latents through the prior $g_\theta$ (top, what
+$q_\phi$ was at step 0) and the fine-tuned posterior flow $g_\phi$ (bottom).}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step10_variational_posterior/figures/calibration.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.85\textwidth]{outputs/step10_variational_posterior/figures/calibration.png}
+\caption{Calibration in the hole: histogram of the standardised truth
+$(x^{*} - \mu)/s$ against $\mathcal{N}(0,1)$, and per-pixel posterior
+standard deviation against absolute error of the posterior mean.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step10_variational_posterior/figures/walk_frames.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step10_variational_posterior/figures/walk_frames.png}
+\caption{Eight frames of the 600-frame latent random walk (\texttt{walk.mp4}
+in the figures folder): the same $z_t$ through the prior (top) and the
+posterior flow (bottom).}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step10analysis}
+
+\paragraph{What was run.} Test image 21587 (all 14 ChestMNIST labels
+negative, i.e. ``no finding''; \texttt{result.json} records only the first
+label), a centred $24 \times 24$ hole, $\sigma = 0.05$; 2000 steps at 3.6 s each,
+126 min on one GPU at 12.4 GB peak; 0 non-finite steps, 0 outliers by the
+paper's rule in every periodic evaluation, in the 128 final samples, and in
+the 600 frames of the walk. The self-test on the real prior before fitting
+reproduced the scratch-test numbers at scale: $x$ from the differentiable
+inverse agrees with the official reverse to $1.2 \times 10^{-6}$, $\log q$
+with the forward $\log p$ to $2.9 \times 10^{-3}$ on values of magnitude
+11,335 (a relative $3 \times 10^{-7}$), and re-loading the checkpoint
+changes $\log p$ by exactly 0. Claims (i)--(iv) and (vi) hold; claim (v)
+does not: the posterior is over-confident in the hole, by a factor of about
+1.6, and the fit was still moving in the right direction when the step
+budget ran out.
+
+\paragraph{(i) The objective.} The negative ELBO fell from 76,343 nats
+(mean of the first ten steps, where $q_\phi \approx p_\theta$; at step 0 the
+data term alone was 165,217, a prior sample being nowhere near the
+measurement) to $-4{,}807$ (mean of the last 100). The data term reached
+$-5{,}548$ against a noise-level value of $-5{,}550$: the residual of a
+posterior sample from $y$ on the observed pixels has RMS $0.0500$ ($0.0492$--$0.0510$
+over the 128 samples), which is $\sigma$ to three digits. The other two
+terms are more interesting than the sum. At initialisation $\log q_\phi =
+-(-\log p_\theta) = 11{,}733$ exactly. Within the first 30 steps the flow
+contracted hard: $\log q_\phi$ rose to 14,700 and $-\log p_\theta$ fell to
+$-13{,}500$ (samples \emph{more} typical under the prior than the prior's own
+samples, and much more concentrated), because the likelihood gradient
+dominates at the start (gradient norm $4 \times 10^{6}$ against the clip at 1).
+The remaining 1,950 steps were spent undoing the contraction: $\log q_\phi$
+decayed to 12,709 and $-\log p_\theta$ rose to $-11{,}968$, while the data term
+stayed at the floor. The end-point $\mathrm{KL}(q_\phi \,\|\, p_\theta) =
+\mathbb{E}_q[\log q_\phi - \log p_\theta] = 741$ nats is the information the
+measurement put into the flow, down from 1,200 at the peak of the
+contraction; the ELBO was still improving by about 3 nats per 100 steps at
+step 2000 (window means $-4{,}761$, $-4{,}791$, $-4{,}804$ over steps
+501--1000, 1001--1500, 1501--2000), so the fit is not converged --- it was
+stopped by the budget, at 2000 steps against the paper's 5k--10k.
+
+\paragraph{(ii) Observed pixels and the hole.} On the observed pixels the
+samples are not merely consistent with $y$ but closer to the truth than $y$
+is: RMS $0.029$ from $x^{*}$ against $0.0495$ for the measurement itself, and
+the posterior mean is $0.021$ from $x^{*}$, 2.3 times closer than $y$ --- the
+prior denoises the observed pixels --- and with a posterior standard
+deviation of $0.019$ there the standardised error has RMS $\approx 1.1$: the
+posterior is calibrated where it is anchored by data. In the hole every sample continues
+the mediastinum, the heart border and the lung fields across the $24
+\times 24$ square with no visible seam (posterior-summary and sample
+figures), and samples differ from one another (RMS difference between
+independent samples $0.068$ in the hole, $0.029$ outside), most along the
+heart--lung border where the standard-deviation map peaks at $0.084$.
+
+\paragraph{(iii) Accuracy.} Posterior-mean PSNR 35.48 dB (hole 28.81 dB),
+SSIM 0.970, against 23.85 dB (hole 15.92), SSIM 0.790 for zero-fill and
+15.20 dB (hole 19.11), SSIM 0.517 for the prior on the same 128 latents. The
+prior's hole PSNR beats zero-fill because the average of 128 unconditional
+chests is a plausible mid-grey chest, but its whole-image PSNR of 15 dB is
+what an unconditioned model is worth here; the 20 dB gained on the whole
+image and the 10--13 dB in the hole are the measurement. Hole PSNR was
+28.8 dB already at step 100 and stayed in 27.8--28.8 dB for the rest of the
+fit: the point estimate converged in the first 100 steps, and everything
+after that was about the spread.
+
+\paragraph{(iv) Spread.} Posterior standard deviation 0.019 on observed
+pixels (below $\sigma = 0.05$, as a posterior on noisy pixels must be) and
+0.045 in the hole (90th percentile 0.068, maximum 0.084), against 0.32 and
+0.25 for the prior. The ratio is right; the absolute level in the hole is
+not, which is claim (v).
+
+\paragraph{(v) Calibration: over-confident by 1.6, with a bias.} The
+standardised truth $(x^{*} - \mu)/s$ over the 576 hole pixels has mean
+$-0.68$ and RMS $1.62$; 44\% of pixels are within $\pm 1$ (68\% if
+calibrated), 80\% within $\pm 2$ (95\%), 20\% beyond $\pm 2$ (5\%) and 6.8\%
+beyond $\pm 3$ (0.3\%). Two things are wrong, and the histogram separates
+them. First, a bias: the posterior mean is brighter than the truth over the
+hole by $0.028$ on the $[-1, 1]$ scale (1.4\% of the range: truth mean 0.203,
+posterior 0.231), so the histogram is shifted left, with 42\% of pixels below
+$-1$ against 14\% above $+1$. Second, the spread is too narrow even after
+removing the bias: $1.62^{2} = 0.68^{2} + 1.47^{2}$, so the remaining scatter
+is 1.5 posterior standard deviations. The error of the posterior mean in the
+hole has RMS $0.0725$ while the posterior standard deviation averages
+$0.045$; the spread-versus-error scatter plot shows the same thing pixel by
+pixel, with most points above the diagonal. The failure is concentrated
+where the data constrain least: in the $16 \times 16$ interior of the hole
+the standardised RMS is $1.87$ (error RMS 0.084, std 0.048), on the four-pixel
+rim it is $1.40$ (0.062, 0.043) --- the error grows toward the centre faster
+than the flow's uncertainty does. This is the reverse-KL failure mode the
+methods bullet named: $\mathrm{KL}(q \,\|\, p)$ is mode-seeking and
+penalises $q$ for putting mass where the posterior has little, not for
+missing mass the posterior has, so an under-dispersed $q$ is a shallow
+minimum. Here it is compounded by the dynamics: the flow over-contracted
+in the first 30 steps (hole std 0.031 at step 100, standardised RMS 2.33)
+and then re-expanded monotonically --- 2.19 at 400, 1.75 at 1000, 1.58--1.69
+over 1400--1900, 1.60 at 2000, with the fraction within $\pm 1$ rising from
+32\% to 43\% --- under the slow entropy gradient. The end point is where the
+budget ran out, not where the trend stopped, and the paper's 5k--10k
+steps (or a larger learning rate once the data term is at the floor) is the
+obvious next experiment; whether reverse KL alone would reach RMS 1 is not
+something this run can say. For contrast, the prior on the same latents
+``passes'' the coverage numbers (71\% within $\pm 1$, 99\% within $\pm 2$,
+RMS 0.89) with a standard deviation of 0.25 and 19 dB in the hole: coverage
+is only meaningful next to the accuracy it is bought with, which is why
+both are reported.
+
+\paragraph{(vi) Stability.} No outliers, no non-finite steps, no
+$|{\rm pixel}| > 2$ in any of the $64 \times 21 + 128 + 128 + 600$ samples
+drawn during the run (21 periodic evaluations, the final posterior and prior
+sets, the walk). The paper's remark that DPI with an NF prior was
+unstable at $10^{-5}$ is not reproduced with this initialisation: starting
+$q_\phi$ at $p_\theta$ means the first samples are already valid images and the
+data term, though huge, is finite and smooth, and the gradient clip
+turns its $4 \times 10^{6}$ norm into a unit step. Whether a from-scratch
+RealNVP with this exact-likelihood prior would have been unstable was not
+tested.
+
+\paragraph{The animation.} \texttt{walk.mp4} shows 600 correlated
+posterior samples, the same $z_t$ through the prior and the posterior flow
+side by side with the measurement and the truth. The prior panel drifts
+between patients, postures and exposures; the posterior panel is one
+patient, and its motion is small by construction --- a hole standard
+deviation of 0.045 on $[-1, 1]$ is about six of 256 grey levels, and 0.019
+outside the hole is two --- and confined to the heart border and lung
+texture inside the square. That is what the posterior of a well-posed
+inpainting problem with 86\% of the pixels observed looks like; it is also,
+per (v), somewhat too still.
+
+\paragraph{What this step does not show.} One image, one mask, one noise
+level, one seed: nothing here is a distribution over problems, and the
+over-confidence factor and the bias are properties of this fit, not
+estimates of the method. The comparison with the paper is qualitative
+(different data, prior and resolution). The fit is not converged.
+
 \section{Reproducibility}
 \begin{itemize}
   \item Global seed \texttt{20260831} (config) seeds torch, numpy, and every
@@ -1747,6 +2305,18 @@ zeros.}
   {\emph{provenance.json not generated yet.}}
 \IfFileExists{../outputs/step8_conditional_flow/data/provenance.json}
   {\verbatiminput{../outputs/step8_conditional_flow/data/provenance.json}}
+  {\emph{provenance.json not generated yet.}}}
+
+\begin{itemize}
+  \item Provenance for steps 9 and 10 (both include the pinned ml-tarflow
+        commit; step 10 also records the step-9 checkpoint it used):
+\end{itemize}
+{\scriptsize
+\IfFileExists{../outputs/step9_chestmnist_tarflow/data/provenance.json}
+  {\verbatiminput{../outputs/step9_chestmnist_tarflow/data/provenance.json}}
+  {\emph{provenance.json not generated yet.}}
+\IfFileExists{../outputs/step10_variational_posterior/data/provenance.json}
+  {\verbatiminput{../outputs/step10_variational_posterior/data/provenance.json}}
   {\emph{provenance.json not generated yet.}}}
 
 \end{document}

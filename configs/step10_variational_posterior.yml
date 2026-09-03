@@ -1,0 +1,50 @@
+# step 10 -- variational posterior for ONE inpainting measurement, following
+# Feng, Smith, Dou, Bouman & Freeman, "Score-Based Diffusion Models as
+# Principled Priors for Inverse Imaging" (ICCV 2023, arXiv 2304.11751), Sec. 3.2:
+# a normalizing flow q_phi(x) is fitted to the posterior p(x | y) by minimising
+# the reverse KL,  E_{x ~ q_phi}[ -log p(y|x) - log p_theta(x) + log q_phi(x) ],
+# with Monte-Carlo batches of samples from q_phi and no tunable weights.
+#
+# Differences from the paper, all deliberate:
+#   * the prior p_theta is the step-9 TarFlow (an exact-likelihood flow), not a
+#     score-based diffusion model, so -log p_theta(x) is one forward pass;
+#   * q_phi has the SAME TarFlow architecture and is INITIALISED AT the prior
+#     (q_phi = p_theta at step 0), i.e. the reconstruction is a fine-tuning of
+#     the unconditional model. The paper starts q_phi from scratch (a RealNVP)
+#     and remarks that a "clever initialization" might stabilise this with an
+#     NF prior;
+#   * samples x = g_phi(z) come from the differentiable, memory-checkpointed
+#     sequential TarFlow reverse in invlib.differentiable_reverse, which also
+#     returns log q_phi(x) exactly (no forward pass through q needed).
+seed: 20260910
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step10_variational_posterior
+prior_config: configs/step9_chestmnist_tarflow.yml
+prior_checkpoint: best            # model_best.pth of step 9 (or "final")
+
+# the single measurement: a centred 24x24 hole in a 64x64 chest radiograph,
+# additive Gaussian noise on the observed pixels (image scale [-1, 1])
+measurement: {name: inpaint_box, box: 24, sigma: 0.05}
+test_index: null                  # null = one seeded random index of the ChestMNIST test split
+
+fit:
+  steps: 2000                     # paper: 5k-10k from scratch; we start at the prior
+  batch: 32                       # Monte-Carlo samples of q_phi per step (paper: 64)
+  lr: 1.0e-5                      # paper: 2e-4 from scratch; 1e-5 in their NF-prior run
+  betas: [0.9, 0.99]
+  grad_clip: 1.0                  # paper: 1
+  log_every: 10
+  eval_every: 100                 # posterior mean/std + PSNR from n_eval fixed-noise samples
+  n_eval: 64
+  ckpt_every: 50
+
+eval:
+  n_samples: 128                  # paper: 128 posterior samples for mean/std/PSNR/SSIM
+  outlier_thresh: 2.0             # paper's rule: discard samples with any |pixel| > 2
+  n_grid: 32
+
+walk:                             # latent random walk z_{t+1} = cos(a) z_t + sin(a) eps
+  n_frames: 600
+  fps: 30
+  angle: 0.08                     # radians per frame; corr(z_t, z_{t+k}) = cos(a)^k
+  batch: 32

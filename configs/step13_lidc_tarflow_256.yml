@@ -1,0 +1,43 @@
+# step13_lidc_tarflow.py -- LIDC 256 x 256 (1.5 mm/px, the native grid of step 12).
+# T = 1024 tokens again (the paper's AFHQ-256 setting): patch 8 -> tokens of dimension
+# 64, i.e. the sequence length of the 128-px model with four times the grey levels
+# per token. Same 512-channel, 8-block, 6-layer transformer (156M parameters); batch 16
+# with per-block activation checkpointing (5.6 GB, 0.84 s/step = 52 ms per image,
+# TF32); 24k images per "epoch" (~17 min).
+
+seed: 20260904
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step13_lidc_tarflow_256
+step12_config: configs/step12_lidc_dataset.yml
+res: 256
+img_size: 256
+channel_size: 1
+patch_size: 8                  # T = 1024 tokens x D = 64
+noise_type: uniform
+hflip: false
+tf32: true
+model:
+  channels: 512
+  blocks: 8
+  layers_per_block: 6
+scale_bound: 8.0
+train:
+  epochs: 30
+  images_per_epoch: 24000      # a quarter of the training split per epoch; 30 epochs =
+                               # 720k images
+  batch: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  block_checkpoint: true
+  eval_every: 1
+  val_subset: 2000
+  early_stop_patience: 6
+  sample_every: 3
+  sample_nrow: 8
+  sample_rows: 4
+  sample_batch: 32
+  test_subset: 0
+  log_every: 500
+nn_check_samples: 16
+nn_train_subset: 20000

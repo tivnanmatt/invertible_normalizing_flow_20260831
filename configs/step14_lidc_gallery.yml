@@ -1,0 +1,37 @@
+# step14_lidc_gallery.py -- the six measurement systems of measlib on LIDC test slices,
+# solved by latent-space MAP (Adam on z, several random restarts) under the step-13
+# prior of each resolution. One config for the whole ladder; `--res N` picks the prior.
+#
+# Every system is y = A x + sigma eps with the EXACT forward operator (pixels, average
+# pooling, or the pixel-driven Radon transform), images on the [-1, 1] scale of the
+# model window (-1000..400 HU, so 0.05 = 35 HU and 0.25 = 175 HU). The parameters are
+# stated for a 64-px image and scaled with the side N so the task stays the same:
+# the box covers 3/8 of the side, CT keeps N/4 views (a constant 6x under-sampling of
+# the ~pi N / 2 Nyquist number) and a sinogram noise proportional to the ray length.
+
+seed: 20260913
+output_root: outputs/step14_lidc_gallery
+prior_checkpoint: best         # step-13 model_best.pth (best validation bpd)
+priors:
+  32: configs/step13_lidc_tarflow_32.yml
+  64: configs/step13_lidc_tarflow_64.yml
+  128: configs/step13_lidc_tarflow_128.yml
+  256: configs/step13_lidc_tarflow_256.yml
+
+restarts: 3                    # independent N(0, I) inits, run as one batch through the
+                               # CUDA-graph reverse
+iters: 300
+lr: 0.1                        # Adam on z, cosine to lr_min (the step-11 sweep: lr 0.1
+                               # best, >= 0.5 drifts)
+lr_min: 0.005
+n_rows: 6                      # one test slice per system (different slices)
+
+systems:
+  - {name: denoise, label: "denoising", sigma: 0.25}
+  - {name: inpaint_box, label: "inpainting, box", box_frac: 0.375, sigma: 0.05}
+  - {name: inpaint_random, label: "inpainting, 70% dropped", drop: 0.7, sigma: 0.05,
+     mask_seed: 0}
+  - {name: sr_2x, label: "super-resolution 2x", sigma: 0.05}
+  - {name: sr_4x, label: "super-resolution 4x", sigma: 0.05}
+  # 16 views, sigma 1.0 at 64 px
+  - {name: ct, label: "sparse-view CT", views_per_px: 0.25, sigma_per_px: 0.015625}

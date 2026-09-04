@@ -644,6 +644,232 @@ def differentiable_reverse(model, z, checkpoint=True, attn_temp=1.0):
     return model.unpatchify(x), log_q
 
 
+# --------------------------------------------------------------------------
+# Fast differentiable sampling direction: CUDA-graph-replayed token steps
+# --------------------------------------------------------------------------
+#
+# The sampling direction of a MetaBlock is autoregressive: token i+1 needs the
+# transformer evaluated on tokens 0..i, so one block is 63 sequential
+# evaluations and one image 8 x 63 = 504 of them, each on a single token.
+# Each evaluation is ~150 tiny kernels whose cost is launch latency, not
+# arithmetic (batch 1 and batch 32 take the same time), and eager autograd
+# pays the same latency again in the backward. Here one token step is a pure
+# function of static shape -- the KV cache is a fixed (B, L, T, C) tensor with
+# the new slot written functionally -- so it can be captured once per block as
+# two CUDA graphs (forward; forward-recompute + backward) and replayed 504
+# times per pass with ~zero launch overhead. `torch.compile` on the pure
+# function additionally fuses the elementwise work before capture. The
+# official module is only read (parameters, permutation); it is never put in
+# sample mode. Saved state per token step is the token and the new cache slot
+# (B, L, C), so no activation checkpointing is needed at batch 32.
+
+N_LAYER_PARAMS = 12
+
+
+def _block_params(blk):
+    """Flat tuple of a MetaBlock's parameter tensors (references, no copies)."""
+    ps = [blk.proj_in.weight, blk.proj_in.bias, blk.proj_out.weight, blk.proj_out.bias]
+    for ab in blk.attn_blocks:
+        a, m = ab.attention, ab.mlp
+        ps += [a.norm.weight, a.norm.bias, a.qkv.weight, a.qkv.bias, a.proj.weight, a.proj.bias,
+               m.norm.weight, m.norm.bias, m.main[0].weight, m.main[0].bias, m.main[2].weight, m.main[2].bias]
+    return tuple(ps)
+
+
+def _token_step(tok, K, V, pos, bias, onehot, scale, n_heads, bound, params):
+    """One token of a MetaBlock's sampling direction as a pure, static-shape function.
+
+    tok (B, Cin): recovered token i; K, V (B, L, T, C): KV caches with slots
+    0..i-1 filled and the rest zero; pos (1, C): positional embedding of slot i;
+    bias (1, T): additive attention bias, 0 for slots <= i and -1e30 beyond;
+    onehot (1, T): indicator of slot i. Returns za, zb (B, Cin) -- the affine
+    parameters for token i+1, as `MetaBlock.reverse_step` -- and the caches
+    with slot i written. Mirrors `Attention.forward_spda` / `MLP` / `MetaBlock.
+    reverse_step` of the official code exactly (LayerNorm eps 1e-5, exact GELU,
+    softmax scale 1/sqrt(head_dim)), all in float32; `bound` (a float or None)
+    applies the `bound_log_scale` squash za -> bound * tanh(za / bound) of the
+    re-classed blocks."""
+    B, L, T, C = K.shape
+    H = n_heads
+    D = C // H
+    w_in, b_in, w_out, b_out = params[:4]
+    x = F.linear(tok, w_in, b_in) + pos
+    Kn, Vn = [], []
+    for l in range(L):
+        (ln1w, ln1b, wqkv, bqkv, wp, bp, ln2w, ln2b, w1, b1, w2, b2) = \
+            params[4 + N_LAYER_PARAMS * l: 4 + N_LAYER_PARAMS * (l + 1)]
+        h = F.layer_norm(x, (C,), ln1w, ln1b, 1e-5)
+        q, k, v = F.linear(h, wqkv, bqkv).split(C, dim=-1)
+        Kl = K[:, l] + onehot[:, :, None] * k[:, None, :]            # slot i written, functionally
+        Vl = V[:, l] + onehot[:, :, None] * v[:, None, :]
+        qh = q.view(B, H, 1, D)
+        Kh = Kl.view(B, T, H, D).transpose(1, 2)                     # (B, H, T, D)
+        Vh = Vl.view(B, T, H, D).transpose(1, 2)
+        s = torch.matmul(qh, Kh.transpose(-1, -2)) * scale + bias[:, None, None, :]
+        o = torch.matmul(s.softmax(-1), Vh).reshape(B, C)
+        x = x + F.linear(o, wp, bp)
+        h = F.layer_norm(x, (C,), ln2w, ln2b, 1e-5)
+        x = x + F.linear(F.gelu(F.linear(h, w1, b1)), w2, b2)
+        Kn.append(Kl)
+        Vn.append(Vl)
+    za, zb = F.linear(x, w_out, b_out).chunk(2, dim=-1)
+    if bound is not None:
+        za = bound * torch.tanh(za / bound)
+    return za, zb, torch.stack(Kn, 1), torch.stack(Vn, 1)
+
+
+class _GraphedBlock:
+    """The two CUDA graphs (forward; recompute + backward) of one MetaBlock's
+    token step at a fixed batch size, with their static buffers."""
+
+    def __init__(self, blk, batch, device, compile=False, warmup=3):
+        self.blk = blk
+        T, C = blk.pos_embed.shape
+        L, Cin = len(blk.attn_blocks), blk.proj_in.in_features
+        a0 = blk.attn_blocks[0].attention
+        self.H, self.scale = a0.num_heads, a0.sqrt_scale ** 2
+        self.bound = float(blk.log_scale_bound) if hasattr(blk, "log_scale_bound") else None
+        self.B, self.T, self.L, self.C, self.Cin = batch, T, L, C, Cin
+        self.params = _block_params(blk)
+        with torch.no_grad():
+            self.pos_table = blk.permutation(blk.pos_embed.detach(), dim=0).contiguous()
+        self.bias_table = torch.triu(torch.full((T, T), -1e30, device=device), 1)   # row i: 0 up to slot i
+        self.onehot_table = torch.eye(T, device=device)
+        z = lambda *s: torch.zeros(*s, device=device)
+        self.s_tok, self.s_K, self.s_V = z(batch, Cin), z(batch, L, T, C), z(batch, L, T, C)
+        self.s_i = torch.zeros(1, dtype=torch.long, device=device)
+        self.s_gza, self.s_gzb = z(batch, Cin), z(batch, Cin)
+        self.s_gKn, self.s_gVn = z(batch, L, T, C), z(batch, L, T, C)
+        self.fn = torch.compile(_token_step, dynamic=False, fullgraph=True) if compile else _token_step
+        leaves = [t.detach().requires_grad_(True) for t in (self.s_tok, self.s_K, self.s_V)]   # share storage
+
+        def run(tok, K, V):
+            i = self.s_i
+            return self.fn(tok, K, V, self.pos_table.index_select(0, i), self.bias_table.index_select(0, i),
+                           self.onehot_table.index_select(0, i), self.scale, self.H, self.bound, self.params)
+
+        def run_bwd():
+            with torch.enable_grad():
+                outs = run(*leaves)
+                return torch.autograd.grad(outs, leaves, grad_outputs=(self.s_gza, self.s_gzb, self.s_gKn, self.s_gVn))
+
+        # warm-up on a side stream (compiles, autotunes, initialises workspaces), then capture
+        s = torch.cuda.Stream(device)
+        s.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(s):
+            for _ in range(warmup):
+                with torch.no_grad():
+                    run(self.s_tok, self.s_K, self.s_V)
+                run_bwd()
+        torch.cuda.current_stream(device).wait_stream(s)
+        torch.cuda.synchronize(device)
+        self.g_fwd = torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(self.g_fwd):
+            self.s_za, self.s_zb, self.s_Kn, self.s_Vn = run(self.s_tok, self.s_K, self.s_V)
+        self.g_bwd = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.g_bwd):
+            self.s_gtok, self.s_gK, self.s_gV = run_bwd()
+        torch.cuda.synchronize(device)
+
+
+class _GraphedStep(torch.autograd.Function):
+    """Replays the block's forward graph; the backward replays the
+    recompute+backward graph with the cache rebuilt from the saved slots."""
+
+    @staticmethod
+    def forward(ctx, tok, K, V, i, gb, hist):
+        gb.s_tok.copy_(tok); gb.s_K.copy_(K); gb.s_V.copy_(V); gb.s_i.fill_(i)
+        gb.g_fwd.replay()
+        hist.append((gb.s_Kn[:, :, i].clone(), gb.s_Vn[:, :, i].clone()))         # the new slot, (B, L, C)
+        ctx.gb, ctx.hist, ctx.i = gb, hist, i
+        ctx.save_for_backward(tok)
+        return gb.s_za.clone(), gb.s_zb.clone(), gb.s_Kn.clone(), gb.s_Vn.clone()
+
+    @staticmethod
+    def backward(ctx, g_za, g_zb, g_Kn, g_Vn):
+        gb, hist, i = ctx.gb, ctx.hist, ctx.i
+        (tok,) = ctx.saved_tensors
+        gb.s_tok.copy_(tok); gb.s_i.fill_(i)
+        gb.s_K.zero_(); gb.s_V.zero_()
+        if i > 0:
+            gb.s_K[:, :, :i] = torch.stack([h[0] for h in hist[:i]], 2)
+            gb.s_V[:, :, :i] = torch.stack([h[1] for h in hist[:i]], 2)
+        gb.s_gza.copy_(g_za); gb.s_gzb.copy_(g_zb); gb.s_gKn.copy_(g_Kn); gb.s_gVn.copy_(g_Vn)
+        gb.g_bwd.replay()
+        return gb.s_gtok.clone(), gb.s_gK.clone(), gb.s_gV.clone(), None, None, None
+
+
+def _block_reverse_graphed(gb, z):
+    """Sampling direction of one MetaBlock with graphed token steps; returns the
+    recovered tokens and the per-example sum of the applied log-scales za."""
+    x = gb.blk.permutation(z)
+    B, T, _ = x.shape
+    toks = [x[:, 0]]
+    K = torch.zeros(B, gb.L, gb.T, gb.C, device=x.device)
+    V = torch.zeros_like(K)
+    sum_za = torch.zeros(B, device=x.device)
+    hist = []
+    for i in range(T - 1):
+        za, zb, K, V = _GraphedStep.apply(toks[i], K, V, i, gb, hist)
+        toks.append(x[:, i + 1] * za.exp() + zb)
+        sum_za = sum_za + za.sum(-1)
+    return gb.blk.permutation(torch.stack(toks, 1), inverse=True), sum_za
+
+
+def _block_reverse_eager(blk, z):
+    """The same recursion with `_token_step` in eager mode (reference / CPU)."""
+    x = blk.permutation(z)
+    B, T, _ = x.shape
+    Tp, C = blk.pos_embed.shape
+    L = len(blk.attn_blocks)
+    a0 = blk.attn_blocks[0].attention
+    bound = float(blk.log_scale_bound) if hasattr(blk, "log_scale_bound") else None
+    params = _block_params(blk)
+    pos_table = blk.permutation(blk.pos_embed, dim=0)
+    bias_table = torch.triu(torch.full((T, T), -1e30, device=x.device), 1)
+    onehot_table = torch.eye(T, device=x.device)
+    toks = [x[:, 0]]
+    K = torch.zeros(B, L, T, C, device=x.device)
+    V = torch.zeros_like(K)
+    sum_za = torch.zeros(B, device=x.device)
+    for i in range(T - 1):
+        za, zb, K, V = _token_step(toks[i], K, V, pos_table[i:i + 1], bias_table[i:i + 1], onehot_table[i:i + 1],
+                                   a0.sqrt_scale ** 2, a0.num_heads, bound, params)
+        toks.append(x[:, i + 1] * za.exp() + zb)
+        sum_za = sum_za + za.sum(-1)
+    return blk.permutation(torch.stack(toks, 1), inverse=True), sum_za
+
+
+class FastReverse:
+    """x = g(z) = f^{-1}(z) for a TarFlow `model`, differentiable w.r.t. z, with
+    every token step replayed from CUDA graphs. Built once per (model, batch
+    size); `mode` is 'graph' (eager kernels inside the graphs), 'compile'
+    (torch.compile'd token step inside the graphs) or 'eager' (no graphs).
+    Returns (x, log_q) exactly as `differentiable_reverse`. The model must be
+    frozen (its parameters are captured by reference) and have unit `var`."""
+
+    def __init__(self, model, batch, device, mode="compile"):
+        if not bool(torch.all(model.var == 1)):
+            raise NotImplementedError("FastReverse assumes the nvp unit base variance")
+        self.model, self.batch, self.mode = model, batch, mode
+        self.device = torch.device(device)
+        self.blocks = [_GraphedBlock(blk, batch, self.device, compile=(mode == "compile"))
+                       for blk in model.blocks] if mode != "eager" else None
+
+    def __call__(self, z):
+        if z.size(0) != self.batch:
+            raise ValueError(f"FastReverse was built for batch {self.batch}, got {z.size(0)}")
+        log_q = -0.5 * (z ** 2 + math.log(2 * math.pi)).flatten(1).sum(-1)
+        x = z
+        for j in reversed(range(len(self.model.blocks))):
+            if self.blocks is None:
+                x, sum_za = _block_reverse_eager(self.model.blocks[j], x)
+            else:
+                x, sum_za = _block_reverse_graphed(self.blocks[j], x)
+            log_q = log_q - sum_za
+        return self.model.unpatchify(x), log_q
+
+
 # ==========================================================================
 # Family 2: InvertibleModule -- general invertible maps with logdet
 # ==========================================================================

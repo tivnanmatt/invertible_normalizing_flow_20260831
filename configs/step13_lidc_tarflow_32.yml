@@ -1,0 +1,41 @@
+# step13_lidc_tarflow.py -- LIDC 32 x 32 (12 mm/px): the smoke test of the resolution
+# ladder. Patch 4 gives T = 64 tokens of dimension 16, the same token count as the
+# step-9 ChestMNIST model, with a small transformer (~40M parameters) so the whole
+# pipeline (data -> prior -> samples -> bpd -> MAP reconstructions) runs in under an hour.
+
+seed: 20260904
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step13_lidc_tarflow_32
+step12_config: configs/step12_lidc_dataset.yml
+res: 32
+img_size: 32
+channel_size: 1
+patch_size: 4                  # T = 64 tokens x D = 16
+noise_type: uniform            # 8-bit uniform dequantization -> bpd is a data likelihood
+hflip: false                   # the heart is on the left: CT slices are not left/right
+                               # symmetric
+tf32: true                     # TF32 matmuls for training only; bpd numbers are exact
+                               # fp32
+model:
+  channels: 384
+  blocks: 6
+  layers_per_block: 4
+scale_bound: 8.0
+train:
+  epochs: 30
+  images_per_epoch: 0          # 0 = the full 95,947-slice training split per epoch
+  batch: 128
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  eval_every: 1
+  val_subset: 0                # all 11,971 val slices
+  early_stop_patience: 5
+  sample_every: 2
+  sample_nrow: 8
+  sample_rows: 8
+  sample_batch: 64
+  test_subset: 0               # all 12,136 test slices
+  log_every: 200
+nn_check_samples: 16
+nn_train_subset: 20000

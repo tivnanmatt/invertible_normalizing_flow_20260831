@@ -1,0 +1,36 @@
+# step 11 -- MAP estimation with Adam for the step-10 inpainting measurement.
+#
+# Two point estimates of the same posterior p(x|y) \propto p(y|x) p_theta(x),
+# with the step-9 TarFlow prior p_theta = g_theta # N(0, I):
+#   latent MAP  z* = argmin_z -log p(y|g_theta(z)) - log N(z)   (Asim et al. 2020;
+#               the Adam warm start of Consistency Posterior Sampling, CVPR 2025)
+#   image MAP   x* = argmin_x -log p(y|x) - log p_theta(x)      (the pixel-space mode,
+#               possible only because the flow's density is available)
+# J_x(g(z)) = J_z(z) - log|det df/dx|(g(z)): they agree only where the flow's
+# log-Jacobian is flat. Every restart of both variants starts from the same
+# prior sample (restart 0 from z = 0, the prior's latent mode).
+seed: 20260911
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step11_map_adam
+step10_config: configs/step10_variational_posterior.yml   # the measurement, the prior and its checkpoint
+step10_output: outputs/step10_variational_posterior        # problem.pt (cross-checked) and samples.pt (reference), when present
+
+map:
+  n_restarts: 32                  # one batch; restart 0 is z = 0, the rest z ~ N(0, I)
+  steps: 1000                     # CPS warm start: 200-800 Adam steps at lr 5e-3
+  lr: 5.0e-3
+  lr_schedule: cosine             # lr * (1 + cos(pi k/K)) / 2; 'constant' reproduces the CPS setting
+  betas: [0.9, 0.999]
+  batch: 32                       # for the no-grad sampling/forward passes
+  log_every: 10
+  frame_every: 10                 # image snapshots for the trajectory animation
+
+variants: [image, latent]         # image first: ~0.3 s/step; latent: the sequential inverse, ~3.5 s/step
+
+verify:
+  fd_steps: [1.0e-1, 3.0e-2, 1.0e-2, 3.0e-3, 1.0e-3]   # central finite differences along the gradient (fp32; best step reported)
+
+eval:
+  outlier_thresh: 2.0
+
+anim: {fps: 10}

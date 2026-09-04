@@ -1,0 +1,44 @@
+# step13_lidc_tarflow.py -- LIDC 64 x 64 (6 mm/px). Patch 4 -> T = 256 tokens of dimension
+# 16 (four times the token count of the step-9 ChestMNIST-64 model, whose 8 x 8 patches
+# left the within-patch structure to the base distribution and gave blobby samples);
+# a 512-channel, 8-block, 6-layer transformer (153M parameters). An "epoch" is a fresh
+# random half of the training split so that validation, checkpoints and sample grids
+# come every ~48k images; 30 epochs = 1.4M images (the 32-px run started to overfit
+# after ~1M). Per-block activation checkpointing: without it the 48 layers at T = 256
+# and batch 64 exceed the 24 GB of the GPU (with it: 5.4 GB, 0.52 s/step, 6.5 min/epoch).
+
+seed: 20260904
+tarflow_repo: /dev_ws/ml-tarflow
+output_root: outputs/step13_lidc_tarflow_64
+step12_config: configs/step12_lidc_dataset.yml
+res: 64
+img_size: 64
+channel_size: 1
+patch_size: 4                  # T = 256 tokens x D = 16
+noise_type: uniform
+hflip: false
+tf32: true
+model:
+  channels: 512
+  blocks: 8
+  layers_per_block: 6
+scale_bound: 8.0
+train:
+  epochs: 30
+  images_per_epoch: 48000      # ~half the 95,947 training slices, resampled every epoch
+  batch: 64
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  block_checkpoint: true
+  eval_every: 1
+  val_subset: 4000
+  early_stop_patience: 6
+  sample_every: 2
+  sample_nrow: 8
+  sample_rows: 8
+  sample_batch: 64
+  test_subset: 0
+  log_every: 200
+nn_check_samples: 16
+nn_train_subset: 20000

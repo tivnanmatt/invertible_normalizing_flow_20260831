@@ -2260,6 +2260,812 @@ over-confidence factor and the bias are properties of this fit, not
 estimates of the method. The comparison with the paper is qualitative
 (different data, prior and resolution). The fit is not converged.
 
+\section{Step 11: MAP estimation with Adam, in latent and in pixel coordinates}
+\label{sec:step11}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step11\_map\_adam.py} (re-uses
+        \texttt{step10.build\_problem}, \texttt{neg\_log\_lik},
+        \texttt{prior\_log\_prob} and \texttt{invlib.differentiable\_reverse});
+        config: \texttt{configs/step11\_map\_adam.yml}; outputs:
+        \texttt{outputs/step11\_map\_adam/\{data,figures\}/}.
+  \item \textbf{Why a point estimate after a posterior.} Step 10 fitted a
+        whole flow to the posterior of one measurement. The simplest
+        reconstruction under the same prior is a maximum-a-posteriori
+        estimate by gradient descent, and it is also the first phase of the
+        methods this document is heading towards: Asim, Daniels, Leong,
+        Ahmed and Hand (``Invertible generative models for inverse problems'',
+        ICML 2020) reconstruct with a Glow prior by minimising
+        $\|A\,g_\theta(z) - y\|^2 + \gamma\|z\|^2$ over the latent $z$, and
+        Consistency Posterior Sampling (Purohit et al., CVPR 2025) starts
+        every chain with 200--800 Adam steps at learning rate $5 \times
+        10^{-3}$ on the noise-space objective $-\log p(y|\Phi(z)) +
+        \tfrac12\|z\|^2$ before ten uncorrected Langevin steps. Step 12 will
+        run Markov chains on the same objective; this step establishes what
+        Adam alone finds, from how many distinct places, and how far that is
+        from the truth, the step-10 posterior and the posterior mode in
+        pixel coordinates.
+  \item \textbf{Two MAP estimates of the same posterior.} With the step-9
+        TarFlow prior $p_\theta = g_{\theta\#}\mathcal{N}(0,I)$, $f_\theta =
+        g_\theta^{-1}$, and the step-10 likelihood $p(y|x) = \mathcal{N}(y;
+        Mx, \sigma^2 I)$ on the observed pixels,
+        \begin{align*}
+          \text{latent MAP:}\quad z^{*} &= \arg\min_z\; J_z(z) =
+            -\log p(y|g_\theta(z)) - \log\mathcal{N}(z;0,I), \qquad
+            \hat x_z = g_\theta(z^{*});\\
+          \text{image MAP:}\quad x^{*} &= \arg\min_x\; J_x(x) =
+            -\log p(y|x) - \log p_\theta(x).
+        \end{align*}
+        $J_z$ is the negative log posterior density in latent coordinates
+        (the posterior of $z$ given $y$ has density $\propto \mathcal{N}(z)\,
+        p(y|g_\theta(z))$, the Jacobian cancelling exactly because
+        $p_\theta(g_\theta(z))\,|\det \partial g_\theta/\partial z| =
+        \mathcal{N}(z)$); $J_x$ is the negative log posterior density in
+        pixel coordinates. Since $\log p_\theta(x) = \log\mathcal{N}(f_\theta(x)) +
+        \log|\det \partial f_\theta/\partial x|$,
+        \[
+          J_x(g_\theta(z)) = J_z(z) - \log\left|\det \frac{\partial f_\theta}{\partial x}\right|_{g_\theta(z)},
+        \]
+        so the two minimisers coincide only where the flow's log-Jacobian
+        is flat. A MAP estimate is not invariant under reparametrisation; a
+        density is. Both constants ($\tfrac{n}{2}\log 2\pi$ and
+        $\tfrac{n_{\rm obs}}{2}\log 2\pi\sigma^2$) are kept, so $J_z$ and
+        $J_x$ are on the same nats scale and every image can be scored under
+        both. The latent MAP is what a one-step generator without a density
+        (a GAN, a consistency model) allows; the image MAP needs
+        $\log p_\theta$ and exists here because the prior is a flow. Their
+        costs are opposite: one step of $J_z$ is the differentiable
+        sequential inverse of step 10 ($8 \times 63$ cached token steps,
+        forward and backward), one step of $J_x$ is one parallel forward
+        pass through the prior with per-block activation checkpointing.
+  \item \textbf{The protocol.} $R = 32$ restarts for each variant, all in
+        one batch: restart 0 starts at $z = 0$, the mode of the latent prior
+        (so $g_\theta(0)$ is the prior's ``most probable'' image in latent
+        coordinates); restarts $1$--$31$ at $z \sim \mathcal{N}(0, I)$. The
+        image variant starts at the same images $x = g_\theta(z)$, so the
+        $r$-th latent and image runs are a pair with a common origin. Adam
+        (lr $5 \times 10^{-3}$ as in Consistency Posterior Sampling,
+        $\beta = (0.9, 0.999)$) for 1000 steps with a cosine decay of the
+        learning rate to zero, on the \emph{sum} of the $R$ objectives:
+        because the objectives are independent and Adam is per-coordinate,
+        this is $R$ independent optimisations in one launch. Non-finite
+        gradients would be zeroed and counted (none are expected). An
+        image snapshot of every restart is kept every 10 steps for the
+        trajectory animation.
+  \item \textbf{Assessment under both objectives.} For any image $x$ one
+        parallel forward pass of the prior gives $z = f_\theta(x)$, the
+        log-Jacobian and $\log p_\theta(x)$, hence $J_z(f_\theta(x))$,
+        $J_x(x)$, their data and prior terms, and $\|z\|$ (whose typical
+        value under the prior is $\sqrt{n} = 64$; a MAP in latent space is
+        pulled towards $\|z\| \ll 64$, far outside the prior's typical set).
+        Per image, PSNR (whole and hole), SSIM, the mean signed error in the
+        hole, the RMS residual on observed pixels, and the maximal $|{\rm
+        pixel}|$ are recorded. The same assessment is applied to the
+        reference points: the truth, the zero-fill $A^{+}y$, the 32 initial
+        prior samples, the mean of the 32 solutions of each variant, and
+        --- when step 10's \texttt{samples.pt} is present --- its 128
+        posterior samples and their mean. The spread of the solutions over
+        restarts is measured by the per-pixel standard deviation map and the
+        mean pairwise RMS distance in the hole, and compared with the step-10
+        posterior standard deviation; the paired distance between the
+        latent and the image solution of the same restart measures how far
+        apart the two modes are.
+  \item \textbf{Self-tests (\texttt{verify.json}, asserted before
+        optimising).} (a) The rebuilt problem is identical (index, $y$,
+        mask, $\sigma$) to step 10's saved \texttt{problem.pt}. (b) The
+        two code paths agree: $J_z$ from the differentiable reverse at $z$
+        equals $J_z$ recomputed from the forward pass at $g_\theta(z)$
+        (round trip $f_\theta(g_\theta(z)) - z$ reported), and $J_x$ from
+        the checkpointed forward equals the official forward. (c) The
+        directional derivative of each objective along its own gradient,
+        autograd against central finite differences at five step sizes
+        ($10^{-1}$ to $10^{-3}$; the best is reported), in float32 --- the
+        official TarFlow code casts to float32 inside its norms, so an
+        fp64 copy cannot run. (d) One full step of each variant at batch
+        32: time, peak memory, finite gradient, and that no block is left in
+        sampling mode.
+  \item \textbf{The falsifiable claims.} (i) Both objectives decrease and
+        plateau; the data term of a MAP falls \emph{below} the noise level
+        $-5550$ nats (a mode fits the observed pixels closer than $\sigma$;
+        only the prior stops it from interpolating the noise), so the
+        observed-pixel RMS residual is below $0.05$. (ii) In every pair,
+        $J_z(z^{*}) < J_z(f_\theta(x^{*}))$ and $J_x(x^{*}) <
+        J_x(g_\theta(z^{*}))$: each solution wins under its own objective,
+        and the two solutions differ visibly, i.e.\ the log-Jacobian is
+        not flat. (iii) Both MAPs sit far below the truth and the step-10
+        samples in their objective (the mode is not typical): $\|z^{*}\| \ll
+        64$ and $-\log p_\theta(x^{*}) \ll -\log p_\theta(x_{\rm true})$.
+        (iv) Restarts do not coincide: the objectives are non-convex and the
+        solutions differ in the hole. (v) Ordering of hole PSNR: the mean of
+        the 32 MAPs beats the single best MAP (averaging removes
+        restart-specific detail), and the step-10 posterior mean, the
+        estimate that targets the MMSE, beats both. (vi) The spread of MAP
+        solutions over restarts in the hole is smaller than the step-10
+        posterior standard deviation, which is itself too small by a factor
+        1.6 (step 10, claim v): a set of MAPs is not a posterior sample.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step11_map_adam.yml}}
+
+\subsection{Results}
+\InputIfFileExists{../outputs/step11_map_adam/data/summary.tex}{}
+  {\emph{not generated yet -- run \texttt{python step11\_map\_adam.py}.}}
+
+\IfFileExists{../outputs/step11_map_adam/figures/curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step11_map_adam/figures/curves.png}
+\caption{Adam on the two objectives, all 32 restarts (thin lines) and their
+median (black), symlog scale. Top: latent MAP, $J_z$ and its data and
+$-\log\mathcal{N}(z)$ terms; bottom: image MAP, $J_x$ with the data and
+$-\log p_\theta(x)$ terms. Dashed green: the truth under the same
+objective; dotted magenta: the mean of the step-10 posterior samples;
+dash-dotted: the noise level of the data term.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step11_map_adam/figures/solutions.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step11_map_adam/figures/solutions.png}
+\caption{Point estimates. Top: truth, measurement, zero-fill, the latent
+MAP with the lowest $J_z$, the image MAP with the lowest $J_x$, and the
+step-10 posterior mean, with PSNR (whole image, hole). Bottom: the mean of
+the 32 latent MAPs, the mean of the 32 image MAPs, and $|{\rm estimate} -
+{\rm truth}|$ for the four estimates with the mean signed error in the hole.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step11_map_adam/figures/restarts.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step11_map_adam/figures/restarts.png}
+\caption{The first eight restarts: the initial prior sample $g_\theta(z_0)$
+(top; restart 0 is $z_0 = 0$), the latent MAP reached from it (middle,
+with its final $J_z$) and the image MAP reached from the same image
+(bottom, with its final $J_x$).}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step11_map_adam/figures/spread.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{outputs/step11_map_adam/figures/spread.png}
+\caption{Spread over restarts on a common colour scale: standard deviation
+of the 32 latent MAPs, of the 32 image MAPs, the mean paired
+$|{\rm latent} - {\rm image}|$ difference, and the step-10 posterior
+standard deviation (mean over hole / observed pixels in the titles).}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step11_map_adam/figures/objectives.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step11_map_adam/figures/objectives.png}
+\caption{Left: every point scored under both objectives (symlog axes):
+the 32 initial prior samples, the latent and image MAPs, the 128 step-10
+posterior samples, the truth and the zero-fill. Middle and right: final
+objective of each restart against the hole PSNR of its solution (restart
+0, from $z = 0$, circled; dashed: zero-fill; dotted: step-10 posterior
+mean).}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step11_map_adam/figures/trajectory_frames.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step11_map_adam/figures/trajectory_frames.png}
+\caption{Eight of the 101 frames of \texttt{trajectory.mp4}: the image at
+Adam step $k$ for restarts 0 ($z = 0$) and 1 (random) of the latent
+(rows 1--2) and the image (rows 3--4) variant.}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step11analysis}
+The claims, in order; the numbers are those of \texttt{summary.tex} above.
+
+\begin{itemize}
+  \item \textbf{(i) is falsified for both variants, and in the latent case
+        the reason is that 1000 steps at lr $5 \times 10^{-3}$ do not
+        converge.} Both objectives decrease throughout, but neither data
+        term reaches the noise level $-5550$: the latent MAPs end at
+        $-3357$ (observed-pixel RMS residual $0.0746$, i.e.\ \emph{above}
+        $\sigma = 0.05$), the image MAPs at $-4845$ ($0.0592$). Both runs
+        flatten as the cosine schedule takes the learning rate to zero
+        (median $J_x$ changes by $-0.003$ nats per step over the last
+        hundred steps, median $J_z$ by $-0.04$), and for the image variant
+        the flat value is plausibly the mode; for the latent variant it is
+        not, it is where the schedule ran out: the learning-rate
+        sweep of Figure~\ref{fig:step11lr}, run afterwards on the same
+        measurement from one random init, reaches $J_z = 3472$ in 100 steps
+        at lr $0.1$ (data term $-2771$) where lr $5 \times 10^{-3}$ gives
+        $20{,}115$, and the 1000-step runs of the protocol ($J_z = 2274 \pm
+        833$ over restarts, best $1013$) are what lr $0.1$ passes after a
+        few hundred steps. No learning rate up to $1$ produced a non-finite
+        gradient or objective (the CUDA-graph reverse and the bounded
+        coupling absorb $z$ of norm 225); the failure at lr $\geq 0.5$ is a
+        different one --- $\|z\|$ drifts to 126 and 225 (typical value 64),
+        $\max|x|$ leaves $[-1,1]$ (1.45, 7.7) and the hole fills with
+        speckle. The usable range is $0.05$--$0.2$, and $0.1$ (monotone
+        descent, 0 increases in 100 steps) is the value the later steps
+        use, with a cosine decay to $5 \times 10^{-3}$. Consistency Posterior
+        Sampling's lr $5 \times 10^{-3}$ was chosen for a different
+        generator; here it is twenty times too small.
+  \item \textbf{(ii) is falsified in its first half.} $J_x(x^{*}) <
+        J_x(g_\theta(z^{*}))$ in 32 of 32 pairs, as claimed, but
+        $J_z(z^{*}) < J_z(f_\theta(x^{*}))$ in \emph{none}: the image MAPs,
+        mapped back to latent coordinates, score $J_z = -443 \pm 124$, far
+        below every latent run's $2274 \pm 833$ and below the truth's 373.
+        The image MAPs are therefore also better latent-MAP candidates than
+        anything Adam found in latent coordinates, which is (i) again: the
+        latent optimisation is the same objective up to the log-Jacobian,
+        and it is simply further from its minimum. The second half of (ii)
+        holds --- the paired latent and image solutions differ by 0.203 RMS
+        in the hole (range 0.10--0.43), the log-Jacobian is $-18{,}211$ at
+        the latent solutions and $-21{,}273$ at the image ones (a difference
+        of 3000 nats, comparable to the data terms themselves), so the two
+        modes are far apart and the reparametrisation matters as much as
+        the likelihood.
+  \item \textbf{(iii) holds for the image MAP and is falsified for the
+        latent one, for the same reason.} The image MAPs sit at $J_x =
+        -21{,}717 \pm 120$ against $-17{,}195$ at the truth and $-17{,}504
+        \pm 96$ for the step-10 samples --- 4500 nats more probable than
+        anything typical of the posterior --- with $\|z\| = 35.7$ ($\sqrt{n}
+        = 64$): the mode of the density in pixel coordinates is far from the
+        typical set. The latent MAPs have $\|z\| = 60.5$ and $J_z$
+        \emph{above} the truth's: they have not collapsed towards the origin
+        because they have not converged; the sweep at lr $0.1$ shows $\|z\|$
+        settling at 70 after 100 steps and the restart from $z = 0$ (restart
+        0) ending at $\|z\| = 13.7$ with $J_z = 1733$, so the eventual
+        latent minimum is at small norm too.
+  \item \textbf{(iv) holds.} The solutions in the hole differ by 0.078 RMS
+        (latent, pairwise mean) and 0.208 (image); the image variant's
+        restart 0 --- started at $g_\theta(0)$ --- lands in a distinct basin
+        with hole PSNR 14.4 dB and a $-0.31$ bias (a dark hole), the worst
+        of the 32, while its $J_x$ ($-21{,}743$) is within 100 nats of the
+        best. The objective in pixel coordinates has many minima of nearly
+        equal depth with very different content.
+  \item \textbf{(v) is falsified in both of its orderings.} Latent: the
+        best-$J_z$ restart has hole PSNR 29.04, the mean of the 32 restarts
+        28.86, the step-10 posterior mean 28.81 --- the averaging removes
+        nothing useful because the restarts hardly differ (spread 0.052),
+        and the posterior mean, whose \emph{whole-image} PSNR of 35.48 is
+        five dB better than any MAP's, is not better in the hole than a
+        single non-converged latent MAP. Image: best restart 23.37, mean
+        23.19, both far below the latent variant (the image modes are
+        sharper, biased, and wrong in different ways, so their mean is
+        blurred rather than improved). The whole-image numbers are the
+        cleaner story: the posterior mean fits the observed pixels to their
+        noise (RMS 0.05) and the latent MAP does not (0.075), which is
+        where the five dB are.
+  \item \textbf{(vi) is falsified.} The hole standard deviation over
+        restarts is 0.052 (latent) and 0.150 (image) against 0.045 for the
+        step-10 posterior samples: neither set of MAPs is \emph{tighter}
+        than the variational posterior. But the comparison is not the one
+        the claim assumed. The latent spread is optimisation noise (32
+        runs, none converged, from different starts); the image spread is
+        between distinct modes; the step-10 spread was itself 1.6 times too
+        small (step 10, claim v). Three different quantities happen to be of
+        the same order; none of them is the posterior's.
+  \item \textbf{The measurement gallery (Figure~\ref{fig:step11gallery}).}
+        With the sweep's schedule (Adam, lr $0.1 \to 5 \times 10^{-3}$,
+        300 steps, 0.82 s per step for three restarts in one CUDA-graph
+        batch) the same latent MAP was run on the six measurement systems
+        of \texttt{measlib} --- each on a different test radiograph, with
+        the exact forward operator rather than the SVD truncation of step 7
+        (average pooling for super-resolution, the $16 \times 91$ Radon
+        sinogram for CT). Every run's data term reaches its noise level
+        within the cosine schedule (denoising 124--152 against 134; box
+        inpainting is the exception, $-3487$ to $-4516$ against $-5550$,
+        with $J_z$ 1272--2606 against 412 at the truth). The pattern that
+        step 14 tests on CT slices at four resolutions is already here: the
+        systems that leave most of the image observed (denoising, random
+        drop, super-resolution) converge to nearly the same image from every
+        start (pairwise RMS 0.026--0.056) and $\|z\|$ collapses well below
+        64 (14--19 for denoising and $4\times$ super-resolution); the
+        systems with a large null space (the box, sparse-view CT) give
+        visibly different restarts (0.050, 0.081) with $J_z$ spread over
+        1300 nats, i.e.\ Adam stops in different local minima of a
+        non-convex objective.
+\end{itemize}
+
+\IfFileExists{../outputs/step11_map_adam/figures/lr_sweep.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step11_map_adam/figures/lr_sweep.png}
+\caption{Learning-rate sweep for the latent MAP (\texttt{step11\_lr\_sweep.py}):
+eight learning rates from one random init on the step-10 measurement, 100
+Adam steps each, all in one batch through the CUDA-graph reverse (105 s).
+Top: $J_z$ (dashed green: the truth) and the data term (dash-dotted: the
+noise level $-5550$), symlog scale. Bottom: the reconstruction after 100
+steps at each learning rate. lr $0.1$ is the fastest monotone descent; at
+$0.5$ and $1$ the latent drifts to $\|z\| = 126$ and 225 and the hole fills
+with speckle, without any non-finite value.}
+\label{fig:step11lr}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step11_map_adam/figures/gallery.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.92\textwidth]{outputs/step11_map_adam/figures/gallery.png}
+\caption{Latent MAP under the step-9 prior on the six measurement systems of
+\texttt{measlib} (\texttt{step11\_gallery.py}), a different ChestMNIST-64
+test image per row: truth, measurement (masked pixels in red; the
+low-resolution image; the $16 \times 91$ sinogram), and three restarts from
+independent $\mathcal{N}(0,I)$ inits (Adam, lr $0.1 \to 5\times10^{-3}$
+cosine, 300 steps) with their PSNR.}
+\label{fig:step11gallery}
+\end{figure}}{}
+\clearpage
+
+\section{Step 12: LIDC-IDRI CT slices on a common physical grid}
+\label{sec:step12}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step12\_lidc\_dataset.py}; config:
+        \texttt{configs/step12\_lidc\_dataset.yml}; outputs:
+        \texttt{outputs/step12\_lidc\_dataset/\{data,figures\}/} and the
+        slice caches under \texttt{/data/image\_benchmarks/lidc/} (gitignored,
+        regenerated by \texttt{--scan --build}). The DICOM reading needs
+        \texttt{pydicom} and the raw archive, which the development container
+        does not mount by design; the scan and build were run in a throw-away
+        container of the same image with \texttt{/data/LIDC} mounted read-only,
+        and everything downstream reads only the derived caches.
+  \item \textbf{Why.} ChestMNIST is a convenience: 8-bit radiographs
+        already down-sampled to 64 px with no physical scale, and a prior on
+        them says nothing about CT. Steps 13--14 want a prior on real
+        tomographic slices with a stated field of view and pixel size, so that
+        ``sparse-view CT'' in step 14 is a measurement of the same physical
+        object at every resolution and a Hounsfield number means what it
+        says. LIDC-IDRI (1018 thoracic CT series from 1010 subjects, TCIA
+        layout on the local \texttt{/data} drive, 243,958 DICOM files) is
+        that data; it was acquired on GE, Siemens, Philips and Toshiba
+        scanners with reconstruction fields of view from 236 to 500 mm and
+        pixel spacings from 0.46 to 0.98 mm, so the slices cannot be used as
+        stored --- they have to be put on one grid.
+  \item \textbf{Header scan and slice selection.} Every file's header
+        (\texttt{stop\_before\_pixels}) is read in a process pool: modality,
+        image position and orientation, pixel spacing, rows/columns, rescale
+        slope and intercept, instance number, thickness, kernel, kVp,
+        reconstruction diameter. A series is kept as axial if its
+        orientation is the identity or its 180$^\circ$ in-plane rotation
+        $(-1,0,0,0,-1,0)$ within $10^{-3}$ (14 series are stored rotated and
+        are un-rotated on reading; without that rule they would have been
+        rejected as ``no axial slices''); the modal (rows, columns, spacing)
+        geometry of the series is used and files with another geometry are
+        dropped; slices are sorted by $z$ and duplicate positions
+        ($|\Delta z| < 10^{-3}$ mm) removed. The $z$ spacing of a series
+        (median $\Delta z$) ranges from 0.45 to 5 mm, and consecutive
+        0.6-mm slices are near-copies, so slices are selected greedily with
+        a stride of at least 2.5 mm along $z$ (thin series contribute every
+        fourth slice, 2.5-mm series every slice); series with fewer than 20
+        slices would be rejected (none is). The split is by \emph{subject}
+        (seeded 80/10/10), never by slice, so that no test slice has a
+        neighbour 2.5 mm away in the training set.
+  \item \textbf{The common grid.} Pixel values are converted to Hounsfield
+        units with the file's slope and intercept (Toshiba stores HU directly
+        with intercept 0 and $-2048$ padding; Philips uses $-1000$; the rest
+        $-1024$), clipped to $[-1024, 3071]$. Each slice is resampled onto a
+        384 mm $\times$ 384 mm field of view at 256 px (1.5 mm/px): the
+        target pixel centres are placed in the scanner's millimetre frame
+        through the pixel spacing, a Gaussian anti-alias filter of standard
+        deviation $(f-1)/2$ source pixels ($f$ = down-sampling factor,
+        1.5--3.3) is applied, and the values are read by bilinear
+        interpolation (\texttt{scipy.ndimage.map\_coordinates}, $-1000$ HU
+        outside the source image). The grid is centred on the body: one
+        shift per series, the centroid of the voxels above $-500$ HU of the
+        whole series, so a slice is not re-centred on its own content and
+        the anatomy does not jitter along $z$ (the patient table pulls the
+        centroid slightly downwards; the 384 mm field is wide enough for
+        that). The 256-px HU slices are stored as \texttt{uint16} (HU $+
+        1024$) and, for the models, windowed to 8 bits over $[-1000, 400]$
+        HU (5.5 HU per grey level: air to the brightest soft tissue and
+        contrast; bone saturates). The 128-, 64- and 32-px versions are $2
+        \times 2$ average pools of the \emph{float} 256-px HU image, then
+        windowed --- exact band-limited versions of one another, not
+        separate resamplings. All caches are memory-mapped \texttt{.npy}
+        files (120,054 slices; the whole build takes 2 minutes on 24
+        processes when the archive is in the page cache).
+  \item \textbf{Self-tests (\texttt{verify.json}, asserted).} (a) A disc
+        of radius 80 mm at an off-centre position, rendered on source
+        grids of 0.6 and 0.95 mm spacing, resamples to the same 64-px
+        target: maximum difference between the two results 0.0023 HU away
+        from the edge, 0.0035 HU against the analytic disc, area error
+        $\leq 0.2\%$ --- the geometry is in millimetres, not in pixels.
+        (b) $2 \times 2$ pooling preserves the mean exactly and the 8-bit
+        window round-trips within 2.75 HU (half a grey level). (c) The
+        selection of a synthetic 160-slice 0.625-mm series returns 40 slices
+        with $\min \Delta z = 2.5$ mm and de-duplicates repeated positions.
+        (d) On the built cache, the 8-bit slices equal the windowed
+        \texttt{uint16} HU slices within one grey level, and the 64-px cache
+        equals the pooled 256-px HU slices within one grey level.
+  \item \textbf{What is shown.} Example 256-px slices in the model window
+        and in a lung window ($-1350$ to 150 HU, from the HU cache); the same
+        four slices at 256, 128, 64 and 32 px; the first series' source
+        image against its resampled version with the shift applied; and
+        histograms of the field of view, pixel spacing, $z$ spacing, slices
+        per series and HU values with the common grid and the model window
+        marked.
+  \item \textbf{The falsifiable claims.} (i) Every one of the 1018 series
+        is usable under the rules above (no rejection, no non-axial
+        series), and the split is by subject with no subject in two splits.
+        (ii) The self-tests pass at the stated tolerances. (iii) The
+        body is inside the 384 mm field in the example slices and the
+        resampled slice is a shifted, smoothed version of the source with
+        the same anatomy (no mirror, no transposition --- the heart on the
+        viewer's right in radiological convention, the spine at the bottom).
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step12_lidc_dataset.yml}}
+
+\subsection{Results}
+\InputIfFileExists{../outputs/step12_lidc_dataset/data/summary.tex}{}
+  {\emph{not generated yet -- run \texttt{python step12\_lidc\_dataset.py --scan --build --verify --collect}.}}
+
+\IfFileExists{../outputs/step12_lidc_dataset/figures/examples_256.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step12_lidc_dataset/figures/examples_256.png}
+\caption{Sixteen training slices on the common grid (384 mm, 256 px) in the
+model window $[-1000, 400]$ HU.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step12_lidc_dataset/figures/examples_lungwindow.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step12_lidc_dataset/figures/examples_lungwindow.png}
+\caption{The same slices from the \texttt{uint16} HU cache in a lung window
+($-1350$ to 150 HU): the vessels and the parenchymal texture that the 8-bit
+model window compresses into its darkest 60 grey levels.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step12_lidc_dataset/figures/resolutions.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{outputs/step12_lidc_dataset/figures/resolutions.png}
+\caption{Four slices at the four resolutions of the ladder (1.5, 3, 6 and
+12 mm/px), each a $2 \times 2$ average pool of the previous.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step12_lidc_dataset/figures/resample_check.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{outputs/step12_lidc_dataset/figures/resample_check.png}
+\caption{The first series' source slice (scanner grid) and its resampled
+version on the common grid, with the body-centroid shift applied.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step12_lidc_dataset/figures/stats.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step12_lidc_dataset/figures/stats.png}
+\caption{The archive: reconstruction field of view (red: the 384 mm common
+grid), pixel spacing, $z$ spacing, slices per series after the 2.5 mm stride,
+and the HU histogram of 200 slices (red: the model window).}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step12analysis}
+\begin{itemize}
+  \item \textbf{(i) holds after one fix that is recorded rather than
+        hidden.} The first scan rejected 14 series as having no axial slice;
+        their orientation was $(-1,0,0,0,-1,0)$, the same plane rotated by
+        180$^\circ$, and reading them with a half-turn brings all 1018
+        series in (243,958 axial images, 243,945 unique $z$ positions:
+        thirteen duplicated positions in the whole archive). No file was
+        excluded for geometry within a series. The subject split is
+        808/101/101 subjects for 95,947/11,971/12,136 slices.
+  \item \textbf{(ii) holds} at the tolerances above; the interesting number
+        is the disc test, 0.002 HU between a 0.6-mm and a 0.95-mm source
+        grid: the anti-alias filter and the millimetre placement are doing
+        what they should, and the 32-px slices (a factor 20--26 below the
+        source spacing) are correctly filtered because they come from the
+        256-px image by exact pooling, not from a bilinear read of a
+        0.7-mm image at one sample per 12 mm.
+  \item \textbf{(iii) holds} in the figures; the body-centroid centring
+        leaves the table and the lower edge of large patients within the
+        field, with the anatomy in the radiological orientation. The
+        price of the fixed field is resolution: 1.5 mm/px is coarser than
+        every scanner's own spacing (median 0.7 mm), so the 256-px model is
+        a prior on a smoothed CT slice, and the 12 mm/px of the 32-px smoke
+        test shows lungs, mediastinum, spine and table as blobs of a few
+        pixels.
+  \item \textbf{What the window does.} Bone and contrast saturate at 400 HU
+        (the histogram's tail to 1500 HU is spine, ribs and calcification);
+        the lungs occupy the lowest 60 of 256 grey levels, so the model
+        window under-resolves the parenchyma the lung window shows. The
+        window is the ChestMNIST-style choice of a single 8-bit image, made
+        so that the step-2/9 pipeline (uniform dequantization, bits per
+        dimension of an 8-bit image) carries over unchanged; a
+        two-window or 12-bit model is a different experiment.
+\end{itemize}
+
+\section{Step 13: TarFlow priors on LIDC slices at 32, 64, 128 and 256 px}
+\label{sec:step13}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step13\_lidc\_tarflow.py} (re-uses
+        \texttt{step9.build\_model/load\_prior/per\_image\_bpd/sample} and
+        \texttt{step12.build\_lidc}); configs:
+        \texttt{configs/step13\_lidc\_tarflow\_\{32,64,128,256\}.yml};
+        outputs: \texttt{outputs/step13\_lidc\_tarflow\_N/\{data,figures\}/}.
+  \item \textbf{Why a ladder.} The whole pipeline (prior, likelihood
+        evaluation, sampling, the inverse and its gradient for step 14) is
+        run first at 32 px, where a training run is twelve minutes and every
+        failure is cheap, and then at 64, 128 and 256 px with the
+        architecture adjusted at each rung. The step-9 recipe is kept
+        (official model, uniform dequantization, AdamW$(0.9,0.95)$, weight
+        decay $10^{-4}$, cosine schedule with a one-epoch warm-up, gradient
+        clipping at 1, bounded scales, early stopping on the validation
+        bits/dim with the best-validation checkpoint kept, official bits/dim
+        on the 8-bit slices; no horizontal flip, because a CT slice is not
+        left--right symmetric); what changes with resolution is the
+        tokenisation and the transformer, stated in each config's header.
+  \item \textbf{Tokenisation.} Step 9 chose $8 \times 8$ patches ($T =
+        64$) for the sake of step 10's differentiable inverse and got
+        blobby samples, because within a token the affine coupling
+        transforms the 64 pixels elementwise given the \emph{previous}
+        tokens only, so intra-patch structure is captured only through the
+        stack of blocks. The TarFlow paper's own recipe is $T = 1024$
+        tokens at every resolution from 64 up (patch 2 at 64, patch 4 at
+        128, patch 8 at 256). The ladder here: 32 px with patch 4 ($T = 64$
+        tokens of 16 grey levels; a 384-channel, 6-block, 4-layer
+        transformer, 42.8M parameters); 64 px with patch 4 ($T = 256$, $D =
+        16$; 512 channels, 8 blocks of 6 layers, 153M); 128 px with patch
+        4 ($T = 1024$, $D = 16$, the paper's sequence length, the same
+        156M-parameter transformer); 256 px with patch 8 ($T = 1024$, $D =
+        64$, the paper's AFHQ-256 setting, same transformer). The 128- and
+        256-px configurations were written after seeing the 64-px samples
+        and are reported with whatever they produced.
+  \item \textbf{Fitting one 24 GB GPU.} Three devices, all recorded in the
+        config: (a) \emph{epochs of a fixed number of images}
+        (\texttt{images\_per\_epoch}, a fresh random subset every epoch;
+        the 32-px run uses the whole split), so that validation, checkpoints
+        and sample grids come at the same interval in images at every
+        resolution --- 96k (32 px), 48k (64) and 24k (128, 256) --- and a
+        30-epoch cosine schedule is 2.9M, 1.4M and 0.7M images; (b)
+        \emph{TF32 matmuls} for the training step only (the 4090 runs them
+        4--8 times faster than fp32); every bits/dim in this document is
+        evaluated with TF32 off; (c) \emph{per-block activation
+        checkpointing} from 64 px on (\texttt{block\_checkpoint}): the
+        official forward is re-run block by block outside the model with
+        \texttt{torch.utils.checkpoint}, storing one block's activations
+        instead of 48 layers' --- the 64-px model at batch 64 runs out of
+        memory without it and takes 5.4 GB with it (0.52 s per step, 6.5
+        min per 48k images). The measured costs of the candidates
+        (\texttt{scratch/probe\_arch.py}, TF32, batch as in the configs):
+        64 px 8.2 ms/image; 128 px at $T = 256$ (patch 8) 8.2 ms with the
+        same net and 21 ms with the paper's 768-channel 8$\times$8 (456M);
+        128 px at $T = 1024$ (patch 4) 52 ms; 256 px at $T = 1024$ (patch 8)
+        52 ms with the 156M net and 124 ms with the 461M one. The $T = 1024$
+        choice therefore costs 42 minutes per 24k images and 21 hours for a
+        30-epoch schedule at 128 and again at 256 px.
+  \item \textbf{What is measured.} As step 9: validation bits/dim every
+        epoch (on a fixed seeded subset of 4000 or 2000 slices from 64 px
+        on; all 11,971 at 32 px), test bits/dim of the final and the
+        best-validation checkpoint on all 12,136 test slices, per image
+        with the outlier accounting of step 9; sample grids from fixed
+        noise with the official sequential reverse (its time recorded; it
+        is $O(T^2)$ per block); non-finite and out-of-range statistics;
+        and the memorisation check against a random 20,000-slice subset of
+        the training split (16 samples, and the validation slices' own
+        nearest-training distance as the reference).
+  \item \textbf{The falsifiable claims.} (i) Validation bits/dim decreases
+        and the test value of the best checkpoint is within a few hundredths
+        of it; if the validation curve turns up while the training loss
+        keeps falling the run is over-fitting and the early-stop rule ends
+        it. (ii) Samples are finite, in range, and are CT slices: a body
+        outline with two lung fields, a mediastinum, a spine and the table.
+        (iii) The samples' nearest-training-image distance is at or above the
+        validation slices' own. (iv) Visual quality improves along the
+        ladder --- each rung shows structure the previous one could not
+        (vessels, fissures, bronchi at 128--256 px) --- rather than merely
+        larger blobs; this is a judgement on the figures, stated as such.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step13_lidc_tarflow_32.yml}}
+{\small\verbatiminput{../configs/step13_lidc_tarflow_64.yml}}
+{\small\verbatiminput{../configs/step13_lidc_tarflow_128.yml}}
+{\small\verbatiminput{../configs/step13_lidc_tarflow_256.yml}}
+
+\subsection{Results}
+\paragraph{32 px.}
+\InputIfFileExists{../outputs/step13_lidc_tarflow_32/data/summary.tex}{}
+  {\emph{not generated yet -- run \texttt{python step13\_lidc\_tarflow.py --config configs/step13\_lidc\_tarflow\_32.yml}.}}
+\paragraph{64 px.}
+\InputIfFileExists{../outputs/step13_lidc_tarflow_64/data/summary.tex}{}
+  {\emph{not generated yet.}}
+\paragraph{128 px.}
+\InputIfFileExists{../outputs/step13_lidc_tarflow_128/data/summary.tex}{}
+  {\emph{not generated yet.}}
+\paragraph{256 px.}
+\InputIfFileExists{../outputs/step13_lidc_tarflow_256/data/summary.tex}{}
+  {\emph{not generated yet.}}
+
+\IfFileExists{../outputs/step13_lidc_tarflow_32/figures/final_samples.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.42\textwidth]{outputs/step13_lidc_tarflow_32/figures/real_grid.png}\hfill
+\includegraphics[width=0.42\textwidth]{outputs/step13_lidc_tarflow_32/figures/final_samples.png}
+\caption{32 px (12 mm/px). Left: 64 training slices. Right: 64 samples from
+the best-validation checkpoint, fixed noise, clamped to $[-1,1]$.}
+\end{figure}}{}
+\IfFileExists{../outputs/step13_lidc_tarflow_32/figures/curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_32/figures/curves.png}
+\caption{32 px: training loss (nats/dim), validation bits/dim (the
+off-scale point at epoch 13 is a transient blow-up on a few validation
+slices, mean $1.7 \times 10^{5}$) and pre-clip gradient norm.}
+\end{figure}}{}
+\IfFileExists{../outputs/step13_lidc_tarflow_32/figures/nearest_neighbours.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_32/figures/nearest_neighbours.png}
+\caption{32 px memorisation check: 16 samples (top) and their $L_2$-nearest
+of 20,000 training slices (bottom, RMS distance), with the validation
+slices' own nearest-training distance in the title.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step13_lidc_tarflow_64/figures/final_samples.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.46\textwidth]{outputs/step13_lidc_tarflow_64/figures/real_grid.png}\hfill
+\includegraphics[width=0.46\textwidth]{outputs/step13_lidc_tarflow_64/figures/final_samples.png}
+\caption{64 px (6 mm/px). Left: 64 training slices. Right: 64 samples from
+the best-validation checkpoint.}
+\end{figure}}{}
+\IfFileExists{../outputs/step13_lidc_tarflow_64/figures/curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_64/figures/curves.png}
+\caption{64 px: training loss, validation bits/dim (4000-slice subset) and
+gradient norm per 48k-image epoch.}
+\end{figure}}{}
+\IfFileExists{../outputs/step13_lidc_tarflow_64/figures/nearest_neighbours.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_64/figures/nearest_neighbours.png}
+\caption{64 px memorisation check.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step13_lidc_tarflow_128/figures/final_samples.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.48\textwidth]{outputs/step13_lidc_tarflow_128/figures/real_grid.png}\hfill
+\includegraphics[width=0.48\textwidth]{outputs/step13_lidc_tarflow_128/figures/final_samples.png}
+\caption{128 px (3 mm/px). Left: 32 training slices. Right: 32 samples from
+the best-validation checkpoint.}
+\end{figure}}{}
+\IfFileExists{../outputs/step13_lidc_tarflow_128/figures/curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_128/figures/curves.png}
+\caption{128 px: training loss, validation bits/dim (2000-slice subset) and
+gradient norm per 24k-image epoch.}
+\end{figure}}{}
+\IfFileExists{../outputs/step13_lidc_tarflow_128/figures/nearest_neighbours.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_128/figures/nearest_neighbours.png}
+\caption{128 px memorisation check.}
+\end{figure}}{}
+
+\IfFileExists{../outputs/step13_lidc_tarflow_256/figures/final_samples.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.48\textwidth]{outputs/step13_lidc_tarflow_256/figures/real_grid.png}\hfill
+\includegraphics[width=0.48\textwidth]{outputs/step13_lidc_tarflow_256/figures/final_samples.png}
+\caption{256 px (1.5 mm/px). Left: 32 training slices. Right: 32 samples
+from the best-validation checkpoint.}
+\end{figure}}{}
+\IfFileExists{../outputs/step13_lidc_tarflow_256/figures/curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_256/figures/curves.png}
+\caption{256 px: training loss, validation bits/dim (2000-slice subset) and
+gradient norm per 24k-image epoch.}
+\end{figure}}{}
+\IfFileExists{../outputs/step13_lidc_tarflow_256/figures/nearest_neighbours.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_256/figures/nearest_neighbours.png}
+\caption{256 px memorisation check.}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step13analysis}
+%% STEP13_ANALYSIS
+
+\section{Step 14: The six measurement systems on LIDC slices, along the ladder}
+\label{sec:step14}
+
+\subsection{Methods}
+\begin{itemize}
+  \item Code: \texttt{step14\_lidc\_gallery.py} (re-uses \texttt{measlib},
+        \texttt{invlib.FastReverse}, \texttt{step11.neg\_log\_normal} and
+        \texttt{step13.load\_prior/build\_bundle}); config:
+        \texttt{configs/step14\_lidc\_gallery.yml} (one config for the whole
+        ladder, \texttt{--res N} selects the prior); outputs:
+        \texttt{outputs/step14\_lidc\_gallery/\{data,figures\}/} with
+        \texttt{gallery\_N.\{json,png\}} and \texttt{gallery\_N\_solutions.pt}
+        per resolution.
+  \item \textbf{What is repeated.} The step-11 gallery
+        (Figure~\ref{fig:step11gallery}): the six measurement systems of
+        \texttt{measlib} --- denoising, box inpainting, random-pixel
+        inpainting, $2\times$ and $4\times$ super-resolution, sparse-view
+        CT --- each on a different test slice, solved by the latent MAP
+        $\arg\min_z -\log p(y|g_\theta(z)) - \log\mathcal{N}(z)$ with Adam
+        (lr $0.1 \to 5\times10^{-3}$ cosine, 300 steps, the schedule of the
+        step-11 sweep) from three independent $\mathcal{N}(0,I)$ inits run
+        as one batch through the CUDA-graph reverse, under the step-13
+        prior of the resolution. Every system is $y = Ax + \sigma\epsilon$
+        with the \emph{exact} forward operator on the $[-1,1]$ scale of the
+        model window (so $0.05 = 35$ HU and $0.25 = 175$ HU): the pixel
+        mask, $2\times 2$ or $4 \times 4$ average pooling, and the
+        pixel-driven Radon transform of \texttt{measlib.radon\_matrix} with
+        $\lceil N\sqrt2\rceil$ detector bins (odd) over 180$^\circ$.
+  \item \textbf{The same task at every resolution.} The parameters are
+        stated at 64 px and scaled with the side $N$: the box covers
+        $3/8$ of the side ($12, 24, 48, 96$ px), the random mask drops 70\%
+        of the pixels, the CT system has $N/4$ views ($8, 16, 32, 64$; a
+        constant six-fold under-sampling of the $\sim\pi N/2$ views the
+        grid would need) and a sinogram noise $\sigma_{\rm ct} = N/64$
+        (the ray sums scale with $N$), the pixel-domain noises are $0.25$
+        (denoising) and $0.05$ (everything else) at every $N$. The
+        measurement of a given slice is therefore the same physical
+        measurement of the same 384 mm object at four samplings.
+  \item \textbf{A matrix-free Radon operator.} \texttt{measlib.ct} builds a
+        dense $M \times N^2$ matrix and its full SVD; at 128 px the
+        $16384^2$ right-singular basis is 1 GB and at 256 px it is 34 GB of
+        float64, beyond the machine. Step 14 therefore uses
+        \texttt{RadonOp}: the same pixel-driven linear interpolation as
+        \texttt{radon\_matrix}, but stored as (index, weight) pairs and
+        applied with \texttt{index\_add\_} --- no matrix, no SVD, exact
+        gradients through autograd. The self-test (\texttt{verify.json})
+        compares it with \texttt{radon\_matrix} at 32 px and 8 angles:
+        values and gradients agree to $1.4 \times 10^{-14}$ and $4.3 \times
+        10^{-14}$ (the weights are kept in float64 and cast per call; a
+        float32 copy at construction gave $4 \times 10^{-7}$ and was
+        rejected).
+  \item \textbf{What is recorded.} Per system and restart: $J_z$, the data
+        term against the expected value at the truth (``noise level'',
+        $\tfrac{M}{2}(1 + \log 2\pi\sigma^2)$), PSNR to the truth, $\|z\|$
+        against the prior's typical $\sqrt{TD}$, $\max|x|$, the mean
+        pairwise RMS between the restarts, seconds per step; the truth's
+        own $J_z$ from the forward pass; and the CUDA-graph build time.
+  \item \textbf{The falsifiable claims.} (i) The pattern of step 11
+        recurs at every resolution: the data term reaches its noise level
+        for all systems except box inpainting and sparse-view CT, whose
+        restarts end in distinct local minima (visibly different content,
+        $J_z$ spread of hundreds of nats). (ii) $\|z\|$ collapses far below
+        $\sqrt{TD}$ where the data are weak ($4\times$ super-resolution,
+        denoising), i.e.\ the latent MAP is not a posterior sample (step
+        11, claim iii). (iii) The cost per Adam step grows as $T \times$
+        blocks: 0.2 s at $T = 64$, 1--1.5 s at $T = 256$, and of the order
+        of 10 s at $T = 1024$, so the gallery at 128 and 256 px is an
+        hours-long computation for eighteen reconstructions --- the
+        motivation for a faster inverse or a different sampler in later
+        steps. (iv) The reconstructions improve in PSNR along the ladder
+        for the pixel-domain systems only insofar as the prior does; for CT
+        the fixed six-fold under-sampling keeps the task equally hard, and
+        the PSNR is a judgement of the prior's detail, not of the sampling.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step14_lidc_gallery.yml}}
+
+\subsection{Results}
+\InputIfFileExists{../outputs/step14_lidc_gallery/data/summary.tex}{}
+  {\emph{not generated yet -- run \texttt{python step14\_lidc\_gallery.py --res 32}.}}
+
+\IfFileExists{../outputs/step14_lidc_gallery/figures/gallery_32.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{outputs/step14_lidc_gallery/figures/gallery_32.png}
+\caption{32 px: truth, measurement (masked pixels in red; the low-resolution
+image; the $8 \times 47$ sinogram) and three latent-MAP restarts with their
+PSNR, one test slice per system.}
+\end{figure}}{}
+\IfFileExists{../outputs/step14_lidc_gallery/figures/gallery_64.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{outputs/step14_lidc_gallery/figures/gallery_64.png}
+\caption{64 px: the same six systems under the 64-px prior (16 views, $\sigma_{\rm ct} = 1$).}
+\end{figure}}{}
+\IfFileExists{../outputs/step14_lidc_gallery/figures/gallery_128.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{outputs/step14_lidc_gallery/figures/gallery_128.png}
+\caption{128 px: the same six systems under the 128-px prior (32 views, $\sigma_{\rm ct} = 2$).}
+\end{figure}}{}
+\IfFileExists{../outputs/step14_lidc_gallery/figures/gallery_256.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{outputs/step14_lidc_gallery/figures/gallery_256.png}
+\caption{256 px: the same six systems under the 256-px prior (64 views, $\sigma_{\rm ct} = 4$).}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step14analysis}
+%% STEP14_ANALYSIS
+
 \section{Reproducibility}
 \begin{itemize}
   \item Global seed \texttt{20260831} (config) seeds torch, numpy, and every

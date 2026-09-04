@@ -1,0 +1,56 @@
+# Config for step12_lidc_dataset.py -- LIDC-IDRI axial CT slices resampled onto
+# one common physical grid, cached at 256/128/64/32 pixels, split by subject.
+#
+# Source: the TCIA LIDC-IDRI download on the axis03 data drive (1,018 CT series
+# from 1,010 subjects, 243,958 DICOM slices; scanner grids are 512 x 512 with
+# pixel spacings 0.46-0.98 mm, i.e. fields of view of 235-500 mm). The step reads
+# the DICOM headers, keeps the axial CT images, sorts them by z, converts to
+# Hounsfield units and resamples every selected slice onto a fixed FOV x FOV mm
+# window centred on the body, so one pixel means the same physical size in every
+# image regardless of the scanner's reconstruction diameter.
+#
+# The /data/LIDC tree is NOT mounted in the recon-dev container (no-scan-data
+# policy); `--scan` and `--build` run in a throw-away container of the same image
+# with /data/LIDC read-only, and only the derived caches land under
+# /data/image_benchmarks/lidc, which recon-dev sees. The dataset class in this
+# file needs only the caches.
+
+seed: 20260904
+# TCIA layout: LIDC-IDRI/<subject>/<study>/<series>/*.dcm + metadata.csv
+lidc_root: /data/LIDC
+cache_root: /data/image_benchmarks/lidc      # where the caches go (visible to recon-dev)
+output_root: outputs/step12_lidc_dataset
+
+grid:
+  fov_mm: 384.0            # common field of view; 256 px -> 1.5 mm/px (128: 3 mm, 64: 6
+                           # mm, 32: 12 mm)
+  base_res: 256            # resolution of the master cache; lower ones are 2x2 average-
+                           # pooled from it
+  resolutions: [256, 128, 64, 32]
+  centre: body             # body = centroid of HU > -500 (per series, one in-plane shift
+                           # for the whole scan); image = scanner centre
+  pad_hu: -1000.0          # value outside the scanner's reconstruction circle / field of
+                           # view
+
+selection:
+  z_stride_mm: 2.5         # keep slices at least this far apart in z (thin-slice scans
+                           # are subsampled, thick ones kept whole)
+  min_slices: 20           # skip series with fewer axial slices than this (localisers,
+                           # broken series)
+  require_axial: true      # ImageOrientationPatient == (1,0,0,0,1,0) within 1e-3, or its
+                           # 180-degree in-plane rotation (-1,0,0,0,-1,0), read un-rotated
+
+intensity:
+  hu_clip: [-1024.0, 3071.0]   # stored as uint16 = HU + 1024 (master cache only)
+  # the model's 8-bit window: -1000 -> 0, 400 -> 255 (5.5 HU per grey level); lung
+  # parenchyma and soft tissue unsaturated, cortical bone saturates at white
+  window_hu: [-1000.0, 400.0]
+
+split:                     # BY SUBJECT (all slices of a subject land in one split),
+                           # seeded
+  val_fraction: 0.10
+  test_fraction: 0.10
+
+workers: 24
+figures:
+  n_examples: 16

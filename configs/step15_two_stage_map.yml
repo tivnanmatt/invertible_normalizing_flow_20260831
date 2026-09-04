@@ -1,0 +1,24 @@
+# step15_two_stage_map.py -- latent initialisation, pixel refinement. Stage 1 is the
+# step-14 gallery (Adam on z, x = g(z), three restarts per system, J_z without the
+# log-determinant); stage 2 continues from each restart's image with Adam on the pixels
+# of x under the exact image-space objective J_x(x) = -log p(y|x) - log p_theta(x)
+# (step 11's image MAP, one parallel forward per step). The control starts the same
+# pixel-domain optimisation from the prior samples g(z_0) that seeded the latent
+# restarts (step 11's pixel-only image MAP), so the two runs differ only in the
+# initialisation. Problems (operators, measurements, test slices) are the stored
+# step-14 ones; `--res N` picks the rung.
+
+seed: 20260904
+output_root: outputs/step15_two_stage_map
+step14_config: configs/step14_lidc_gallery.yml     # priors, systems, seeds; solutions under its output_root
+
+pixel:                          # stage 2, both variants
+  iters: 1000
+  lr: 5.0e-3                    # the step-11 image-MAP schedule: Adam on the [-1, 1] pixels,
+  lr_min: 0.0                   # cosine to zero over the run
+  betas: [0.9, 0.999]
+  log_every: 100
+variants: [latent_then_pixel, pixel_only]
+# sensitivity of the refined objective to the pixel learning rate (latent_then_pixel only;
+# the main result above keeps the step-11 value, chosen before the sweep)
+lr_sweep: [1.0e-3, 2.0e-2]

@@ -3396,6 +3396,709 @@ the numbers in parentheses below).
 \end{itemize}
 %% STEP14_ANALYSIS_128
 
+\section{Step 15: Latent initialisation, pixel-domain refinement}
+\label{sec:step15}
+
+\subsection{Methods}
+\begin{itemize}
+  \item \begin{sloppypar}Code: \texttt{step15\_two\_stage\_map.py} (re-uses
+        \texttt{step14.make\_problem} with the stored measurement,
+        \texttt{step11.neg\_log\_normal}, \texttt{step10.draw\_samples} and
+        \texttt{step13.load\_prior}); config:
+        \texttt{configs/\allowbreak step15\_two\_stage\_map.yml}; outputs:
+        \texttt{outputs/step15\_two\_stage\_map/\{data,figures\}/} with
+        \texttt{two\_stage\_N.\{json,png\}}, \texttt{two\_stage\_N\_curves.png},
+        \texttt{two\_stage\_N\_solutions.pt} and
+        \texttt{two\_stage\_N\_traces.npz} per resolution. Added on
+        2026-09-04, at Matt's request, while the 128-px prior trained; the
+        32-px run took 32 s per variant on the shared GPU, the 64-px run
+        284 s.\end{sloppypar}
+  \item \textbf{The estimator.} Two stages. Stage 1 is step 14 itself: the
+        latent MAP, Adam on $z$ with $x = g_\theta(z)$ and
+        $J_z(z) = -\log p(y|g_\theta(z)) - \log\mathcal{N}(z;0,I)$, three
+        random restarts per system, whose solutions are read from
+        \texttt{gallery\_N\_solutions.pt}. Stage 2 takes each restart's
+        image $x_1 = g_\theta(z_1)$ as the initialisation of Adam on the
+        \emph{pixels} of $x$ under the exact image-space objective of step
+        11,
+        \[
+          J_x(x) = -\log p(y|x) - \log p_\theta(x)
+                 = -\log p(y|x) + \tfrac12\|f_\theta(x)\|^2 + \tfrac{n}{2}\log 2\pi
+                   - \log\bigl|\det \partial f_\theta/\partial x\bigr|,
+        \]
+        with $f_\theta = g_\theta^{-1}$ the parallel transformer forward
+        (\texttt{prior(x)} returns $z$ and the per-dimension mean
+        log-determinant, multiplied by $n = N^2$). $J_x$ is the posterior
+        density in $x$; $J_z$ is not --- it is $J_x \circ g_\theta$
+        \emph{without} the log-determinant --- so the two objectives have
+        different minimisers and stage 2 is not a continuation of stage 1
+        but a change of objective from the point stage 1 found. A step is
+        one forward/backward pass through the prior (no sequential reverse,
+        no checkpointing at 32 px), 32 ms for the batch of 18 against 0.28 s
+        for a latent step, so 1000 pixel steps cost less than a hundred
+        latent ones. The schedule is step 11's image-MAP one: lr $5 \times
+        10^{-3}$, cosine to zero, 1000 steps, betas $(0.9, 0.999)$,
+        non-finite gradients zeroed and counted (none occurred). All 18 rows
+        run as one batch (independent objectives, elementwise optimiser).
+  \item \textbf{The problems are the stored ones.} \texttt{make\_problem}
+        gained an optional \texttt{y}: with it the operator is rebuilt from
+        the step-14 spec at side $N$ (the random mask from its
+        \texttt{mask\_seed}) and the stored measurement is used, so no noise
+        is drawn. The script checks itself against
+        \texttt{gallery\_N.json}: the data terms of the stored images agree
+        to $1.2 \times 10^{-4}$ nats, $J_z$ recomputed with $z = f_\theta(x_1)$
+        to $1.2 \times 10^{-3}$ nats, and $\max|f_\theta(g_\theta(z_1)) -
+        z_1| = 3.0 \times 10^{-4}$ (the fp32 round trip of the flow).
+  \item \textbf{The control.} The same pixel-domain optimisation, same
+        schedule, started from the prior samples $g_\theta(z_0)$ that seeded
+        the latent restarts ($z_0$ regenerated from the step-14 seeds and
+        pushed through the official reverse): step 11's pixel-only image
+        MAP. The two variants differ only in their initialisation, so the
+        value of the latent stage is read off directly. A sensitivity run
+        repeats the latent-then-pixel variant at lr $10^{-3}$ and $2 \times
+        10^{-2}$ (\texttt{lr\_sweep}; the main result keeps the step-11
+        value, fixed before the sweep).
+  \item \textbf{What is recorded.} Per system, restart and variant, at the
+        initialisation and at the end: $J_x$, $J_z$ (the latent objective
+        evaluated at $z = f_\theta(x)$), the data term against its noise
+        level, the log-determinant, $\|f_\theta(x)\|$ against $\sqrt{TD}$,
+        PSNR, $\max|x|$; the restart spread (mean pairwise RMS); the
+        per-step traces of $J_x$ and its three terms; the truth's own
+        values of everything. The figures show, per system, the
+        lowest-$J_x$ restart of each variant before and after stage 2, and
+        the traces of $J_x - J_x(\text{truth})$ and of the squared residual
+        $\|y - Ax\|^2/(M\sigma^2)$ (1 at the noise level) for all restarts.
+  \item \textbf{What step 11 predicts.} This experiment was requested and
+        run in one go, so the expectations below are step 11's findings
+        transcribed, not claims fixed in advance of the design. (a) The
+        pixel stage will lower $J_x$ \emph{below the truth's} in every
+        system, with $\|f_\theta(x)\| \ll \sqrt{TD}$ and the log-determinant
+        above the truth's: the pixel-space mode is a density spike outside
+        the typical set (step 11, claim iii, where the image MAPs sat 4500
+        nats below the truth at $\|z\| = 36$ against $\sqrt n = 64$). (b)
+        The latent initialisation will reach lower $J_x$, better PSNR and a
+        smaller restart spread than the pixel-only control from prior
+        samples (step 11: the image restarts from $g_\theta(z_0)$ landed in
+        many basins of nearly equal depth and different content, spread
+        0.208). (c) Whether stage 2 improves the \emph{image} over stage 1
+        is the open question and the reason for the experiment: the
+        latent MAP's known failure at 32 px is noise fitting (denoising,
+        residual two thirds of $\sigma^2$, 3.5 dB lost; step 14), which a
+        log-determinant term that penalises speckle might repair, or might
+        over-repair into the over-smooth spike of (a).
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step15_two_stage_map.yml}}
+
+\subsection{Results}
+Each line reports, per system, the lowest-$J_x$ restart of the two-stage
+estimator (before $\to$ after stage 2) with the truth's value and the
+lowest-$J_x$ restart of the pixel-only control; ``data'' is the data term
+at the end of stage 2.
+
+\InputIfFileExists{../outputs/step15_two_stage_map/data/summary.tex}{}
+  {\emph{not generated yet -- run \texttt{python step15\_two\_stage\_map.py --res 32}.}}
+
+\IfFileExists{../outputs/step15_two_stage_map/figures/two_stage_32.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.95\textwidth]{outputs/step15_two_stage_map/figures/two_stage_32.png}
+\caption{32 px: truth, measurement, the latent MAP of step 14 and its
+pixel-domain refinement (lowest-$J_x$ restart), and the prior sample that
+seeded that system's best pixel-only restart with its pixel-only MAP; PSNR
+and $J_x$ in the titles.}
+\label{fig:step15gallery32}
+\end{figure}}{}
+\IfFileExists{../outputs/step15_two_stage_map/figures/two_stage_32_curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step15_two_stage_map/figures/two_stage_32_curves.png}
+\caption{32 px, the pixel-domain stage for all restarts: $J_x - J_x(\text{truth})$
+(top, symmetric log) and the squared residual in units of $M\sigma^2$
+(bottom, log; the dashed line is the truth's), latent initialisation in
+blue, prior-sample initialisation in orange.}
+\label{fig:step15curves32}
+\end{figure}}{}
+\IfFileExists{../outputs/step15_two_stage_map/figures/two_stage_64.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.95\textwidth]{outputs/step15_two_stage_map/figures/two_stage_64.png}
+\caption{64 px: the same, from the 64-px latent MAPs of step 14.}
+\label{fig:step15gallery64}
+\end{figure}}{}
+\IfFileExists{../outputs/step15_two_stage_map/figures/two_stage_64_curves.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step15_two_stage_map/figures/two_stage_64_curves.png}
+\caption{64 px, the pixel-domain stage for all restarts.}
+\label{fig:step15curves64}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step15analysis}
+\paragraph{32 px ($T = 64$).}
+\begin{itemize}
+  \item \textbf{(a) holds, in every system.} Stage 2 ends 560--1060 nats
+        below the truth's $J_x$: $-3441$ against $-2472$ (denoising),
+        $-5228$ against $-4659$ (box), $-3873$ against $-3168$ (random
+        inpainting), $-4146$ against $-3540$ ($2\times$ SR), $-3958$
+        against $-2903$ ($4\times$ SR), $-3500$ against $-2942$ (CT); the
+        latent MAPs were already below the truth in five of the six (by
+        140--614 nats; denoising 204 above), and stage 2 takes off another
+        144--1173. $\|f_\theta(x)\|$ ends at 13--19 against the truth's
+        27--31 and $\sqrt{TD} = 32$. Where the nats come from is the
+        log-determinant: in denoising it rises from 3204 at the latent MAP
+        to 4640 (the truth's is 3920), while the data term \emph{worsens}
+        from $-114$ to $+162$ and $J_z$, the latent objective evaluated at
+        the refined point, \emph{rises} from 934 to 1198. The same in every
+        system: the log-determinant at the refined points is 280--780 nats
+        above the truth's (4640, 4935, 4478, 4813, 4937, 4801 against 3920,
+        4579, 4119, 4448, 4158, 4517) and $J_z$ rises in four of six
+        (denoising, random inpainting, both super-resolutions; it falls in
+        box inpainting and CT). The
+        refined point is a place where $f_\theta$ expands volume most ---
+        a small pixel neighbourhood mapped onto a large latent one --- i.e.\
+        a spike of the density that carries little mass, and the images
+        show what such a spike looks like for this prior: a smooth slice
+        without lung texture (Figure~\ref{fig:step15gallery32}, fourth
+        column).
+  \item \textbf{(c): stage 2 makes the image worse in four systems, better
+        in one.} PSNR of the lowest-$J_x$ restart, stage 1 $\to$ stage 2:
+        $23.3 \to 22.7$ (denoising), $20.2 \to 20.0$ (box; the third
+        restart $21.6 \to 23.2$, but its $J_x$ is 11 nats higher), $23.5 \to
+        25.8$ (random inpainting), $27.8 \to 27.6$ ($2\times$ SR; the best
+        latent restart $29.8 \to 28.5$), $25.1 \to 22.0$ ($4\times$ SR),
+        $27.2 \to 26.2$ (CT). The residual explains the split. Stage 1 had
+        fitted below the noise in five systems (squared residual
+        $0.47$--$0.86$ of $M\sigma^2$: the noise fitting of step 14; the
+        box-inpainting restart sat above it at $1.13$); stage 2 moves it up
+        --- to the truth's level where the data are informative (box
+        $0.93$, random inpainting $1.00$, CT $0.94$; truth $1.00$, $0.97$,
+        $1.02$) and \emph{past} it where they are not (denoising $1.25$,
+        $2\times$ SR $1.18$, $4\times$ SR $2.7$; truth $0.99$, $0.85$,
+        $0.75$). In random inpainting
+        the 305 observed pixels pin the image and the log-determinant only
+        removes the speckle the latent MAP had put into the 719 missing
+        ones: $+2.3$ dB. In denoising and $4\times$ SR the log-determinant
+        overrules the likelihood: the refined image fits $y$ worse than the
+        truth does, and loses 0.6 and 3.1 dB. The latent MAP's
+        noise-fitting and the pixel MAP's over-smoothing are the two
+        failures of the two objectives, in opposite directions, and neither
+        is the posterior mean (step 10's, at ChestMNIST, beat both MAPs by
+        five dB).
+  \item \textbf{The window.} The latent MAPs run outside the model's
+        $[-1, 1]$ range ($\max|x|$ 1.36--1.38 in denoising, 1.6 in one
+        $2\times$ SR restart); every refined image is within 1.02. The
+        density falls steeply outside the range of the training images and
+        the pixel objective sees that directly, while the latent objective
+        sees it only through $g_\theta$ and the Gaussian term.
+  \item \textbf{One basin from three starts.} In denoising, random
+        inpainting, $4\times$ SR and CT the three refined images are the
+        same to 0.003 RMS or better, although they started from latent
+        solutions 0.03--0.12 apart (step 14's spreads): $J_x$ has one deep
+        basin near the latent solutions in these systems. Box inpainting
+        keeps three minima (spread 0.191, PSNR 19.4--23.2, $J_x$ within 28
+        nats) --- the hole content remains multimodal under both objectives
+        --- and $2\times$ SR keeps a small spread (0.022, $J_x$ within 23
+        nats).
+  \item \textbf{(b) holds: the latent initialisation matters for the
+        optimisation.} From the prior samples ($J_x$ between $-1873$ and
+        $+236{,}915$ at the start, data terms up to $2 \times 10^{5}$) the
+        same 1000 steps end 2--200 nats above the two-stage values in five
+        systems (denoising $-3439$, box $-5031$, random $-3804$, $2\times$
+        SR $-4103$, $4\times$ SR $-3824$) with the best PSNRs 0.0--3.6 dB
+        lower (22.7, 19.0, 24.9, 27.3, 18.4) and spreads 0.11--0.25 against
+        $\le 0.02$ for the four single-basin systems; in CT two of the three
+        pixel-only restarts fail outright ($J_x = -1453$ and $+1626$, data
+        terms 773 and 2313 against a noise level of 273, $\max|x|$ 1.9) and
+        the third reaches $-3331$ at 22.6 dB against $-3500$ and 26.2 dB.
+        The traces (Figure~\ref{fig:step15curves32}) show the pixel-only
+        runs still descending in box inpainting and CT when the learning
+        rate reaches zero: they are limited by the schedule, the two-stage
+        runs are converged by step 400. The ordering by image quality is
+        therefore latent MAP $\ge$ latent-then-pixel $>$ pixel-only in five
+        systems, with random inpainting the exception where the middle one
+        wins.
+  \item \textbf{Learning rate.} At $2 \times 10^{-2}$ the refined $J_x$
+        agrees with the $5 \times 10^{-3}$ run to within 15 nats in every
+        system (lower by 4 in box inpainting, higher by 14 in $2\times$ SR);
+        at $10^{-3}$ it is short by 0--80 nats and the images are 0--2 dB
+        better --- because they are less converged, i.e.\ nearer the latent
+        MAP, not because the optimiser found a better minimum. The main
+        run is converged.
+  \item \textbf{What it means.} The two-stage procedure is the best
+        optimiser of $J_x$ in this paper --- the lowest values from any
+        start, all restarts agreeing, 32 s --- and what it shows is that
+        minimising $J_x$ is not what one wants: the density in pixel
+        coordinates has spikes at smooth images that are 280--780 nats
+        more probable than any real slice, and a good optimiser finds them.
+        The latent MAP is the better estimator at 32 px not because it
+        optimises better but because its objective, lacking the
+        log-determinant, does not see the spikes --- and it has its own
+        opposite failure. A tempered log-determinant, or the refined point
+        as the starting point of a sampler or of the step-10 posterior
+        mean, would be new estimators, to be claimed before they are run.
+\end{itemize}
+\paragraph{64 px ($T = 256$).}
+\begin{itemize}
+  \item \textbf{(a) holds again, four times larger.} Stage 2 ends
+        2,900--6,100 nats below the truth's $J_x$: $-15{,}975$ against
+        $-11{,}874$ (denoising), $-23{,}354$ against $-20{,}146$ (box),
+        $-17{,}422$ against $-14{,}256$ (random inpainting), $-18{,}363$
+        against $-15{,}075$ ($2\times$ SR), $-18{,}900$ against $-12{,}821$
+        ($4\times$ SR), $-15{,}030$ against $-12{,}126$ (CT). The
+        log-determinant at the refined points is 2,500--5,400 nats above the
+        truth's (21,136, 22,588, 20,431, 21,720, 23,139, 21,815 against
+        17,565, 19,667, 17,906, 19,043, 17,784, 19,247) and $\|f_\theta(x)\|$
+        ends at 39--45 against the truth's 50--61 and $\sqrt{TD} = 64$. The
+        typical-set gap scales with $n$ ($n/2 = 2048$ nats here against 512
+        at 32 px) and so does the spike's depth. Every refined image is
+        within $\max|x| \le 1.21$ (latent MAPs up to 2.36).
+  \item \textbf{(c) reverses: stage 2 improves the image in four systems
+        and hurts one.} PSNR of the lowest-$J_x$ restart, stage 1 $\to$
+        stage 2: $26.4 \to 23.1$ (denoising; every restart loses 2.5--3.3
+        dB), $18.4 \to 18.3$ (box), $23.9 \to 26.1$ (random inpainting),
+        $27.3 \to 27.6$ ($2\times$ SR), $23.5 \to 23.7$ ($4\times$ SR;
+        the image is a featureless lung outline at both stages), $24.6 \to
+        27.1$ (CT). This is not the 32-px picture, and the residuals say
+        why. At 32 px stage 1 had over-fitted the data in five systems;
+        at 64 px the latent MAPs of step 14 (1000 Adam steps at $T = 256$)
+        are \emph{under}-fitted in three: their squared residuals are 4.2
+        (random inpainting), 1.6 ($2\times$ SR) and 1.7 (CT) times
+        $M\sigma^2$ against the truth's 0.96, 1.07 and 1.04, i.e.\ stage 1
+        had not converged, and stage 2 finishes its job --- the residual
+        falls to 1.37, 1.83 and 1.25 and $J_z$, the latent objective,
+        \emph{falls} too (random inpainting $4435 \to 3008$, CT $7592 \to
+        6785$). So the two systems with the largest gains ($+2.2$ and
+        $+2.5$ dB) are the ones where the pixel stage is partly a better
+        optimiser of the \emph{latent} objective, not evidence that the
+        log-determinant helps. Where stage 1 was converged the 32-px
+        pattern returns: denoising (stage-1 residual 0.92) goes to 1.24
+        and loses 3.3 dB with the log-determinant up 3,570 nats and the
+        data term up from $-33$ to $+628$ against a noise level of 134;
+        $4\times$ SR (0.95) goes to 1.97 and gains nothing.
+  \item \textbf{Basins.} The refined restarts agree less than at 32 px:
+        spreads 0.021 (CT), 0.035 ($2\times$ SR), 0.058 (denoising), 0.064
+        (random inpainting), 0.077 ($4\times$ SR), 0.145 (box; PSNR
+        18.3--18.9), with $J_x$ within 110--460 nats across restarts. With
+        four times the dimensions the pixel objective keeps more than one
+        spike near the latent solutions.
+  \item \textbf{(b) holds, more strongly.} The pixel-only control from
+        prior samples ends 600--2,100 nats above the two-stage values in
+        five systems (denoising $-13{,}870$, box $-22{,}467$, random
+        $-15{,}724$, $2\times$ SR $-17{,}302$, $4\times$ SR $-18{,}293$)
+        with the lowest-$J_x$ restart 0.7--9.3 dB worse (16.2, 17.6, 16.8,
+        25.5, 19.4) and spreads 0.09--0.37; in denoising its residual is 2.47
+        $M\sigma^2$ and the image is a blur (Figure~\ref{fig:step15gallery64},
+        last column). In CT all three pixel-only restarts diverge: from
+        $J_x$ between $2.5 \times 10^{5}$ and $6.5 \times 10^{5}$ at the
+        start (data terms $2.6$--$6.6 \times 10^{5}$) the lowest value
+        reached along the way is $+11{,}725$, and the runs end at $J_x$
+        $3.5 \times 10^{13}$ to $1.3 \times 10^{15}$ with $\|f_\theta(x)\|$
+        of $10^{7}$, $\max|x|$ 1.7 and 13--15 dB: the step-11 image MAP
+        from a prior sample does not work for CT at 64 px at this
+        learning rate. The ordering by image quality is latent-then-pixel
+        $\ge$ latent MAP $>$ pixel-only in five systems, latent MAP first
+        in denoising.
+  \item \textbf{Learning rate.} $2 \times 10^{-2}$ is unstable at 64 px:
+        12 of the 18 rows diverge ($J_x$ up to $10^{25}$), one ends at
+        $+47{,}000$, and the five that survive end 1,500--4,600 nats above
+        the main run. $10^{-3}$
+        is short by 60--2,400 nats (most in random inpainting) and, being
+        nearer the latent MAP, is 1.4--2.2 dB better in denoising and
+        1.4--3.5 dB worse in random inpainting. The main run at $5 \times
+        10^{-3}$ is converged to within 20--95 nats over its last 400
+        steps (Figure~\ref{fig:step15curves64}) and is the one reported.
+  \item \textbf{What changes with $n$.} The spike is deeper (the
+        log-determinant excess grows from 280--780 to 2,500--5,400 nats)
+        but its image is no worse relative to the latent MAP than at 32 px,
+        because at 64 px the latent MAP is the weaker optimiser: 1000
+        latent steps at $T = 256$ leave three systems under-fitted, and the
+        cheap pixel stage (0.28 s per step for the batch of 18) recovers
+        what stage 1 left. A fair comparison of the two objectives at 64 px
+        needs a converged stage 1 (more latent steps, or a smaller
+        learning-rate floor) --- a change to step 14's configuration, to
+        be claimed before it is run. What holds at both resolutions is the
+        denoising case, the one system where stage 1 is converged and the
+        data are least informative: there the log-determinant costs 0.6 dB
+        at 32 px and 3.3 dB at 64 px, growing with $n$ as the typical-set
+        argument says it should.
+\end{itemize}
+
+\section{Step 16: Random walks on the posterior, in latent coordinates}
+\label{sec:step16}
+
+\subsection{Methods}
+\begin{itemize}
+  \item \begin{sloppypar}Code: \texttt{step16\_latent\_langevin.py} (re-uses
+        \texttt{step14.make\_problem} with the stored measurements,
+        \texttt{step13.load\_prior}, \texttt{invlib.FastReverse}); configs:
+        \texttt{configs/step16\_latent\_langevin.yml} (the main run) and
+        \texttt{configs/step16\_latent\_langevin\_stiff.yml} (the follow-up,
+        tag \texttt{\_stiff}); outputs:
+        \texttt{outputs/step16\_latent\_langevin/\{data,figures\}/} with
+        \texttt{langevin\_N.json}, \texttt{langevin\_N\_frames.npz} (every
+        recorded state and the per-iteration traces),
+        \texttt{langevin\_N\_solutions.pt}, the stills
+        \texttt{langevin\_N.png}, \texttt{langevin\_N\_variants.png},
+        \texttt{langevin\_N\_traces.png} and one video per system,
+        \texttt{langevin\_N\_\{system\}.mp4}. Added on 2026-09-04 at Matt's
+        request (``instead of MAP, generate mp4 videos of a random walk on
+        the posterior for each measurement model, in the latent domain
+        only''), run at 32 px while the 128-px prior trained.\end{sloppypar}
+  \item \textbf{The target.} In latent coordinates the posterior is
+        \[
+          p(z \mid y) \;\propto\; p\bigl(y \mid g_\theta(z)\bigr)\,\mathcal{N}(z; 0, I)
+        \]
+        \emph{exactly}: $x = g_\theta(z)$ is a bijection, so the change of
+        variables from $p(x \mid y)$ to $z$ multiplies by
+        $|\det \partial g_\theta / \partial z|$, and the prior density
+        $p_\theta(g_\theta(z)) = \mathcal{N}(z)\,|\det \partial f_\theta/\partial x|$
+        divides by the same factor. No log-determinant appears --- the
+        latent objective $J_z$ of step 14, which is \emph{not} a density in
+        $x$, is the exact negative log-density of the posterior in $z$, and
+        a Markov chain with that target, pushed through $g_\theta$, samples
+        $p(x \mid y)$. The two MAP failures of steps 14 and 15 (the latent
+        MAP's noise fitting, the pixel MAP's density spikes) are properties
+        of modes; samples from the same posterior have neither by
+        construction, which is the hypothesis Matt put forward: ``MAP for a
+        Gaussian is also the mean of the distribution, so maybe that's why
+        it's coming out blurry --- it's averaging all possible things''.
+        The experiment shows what the samples look like, and what their
+        running mean looks like next to them.
+  \item \textbf{The sampler.} Hamiltonian Monte Carlo on $z$ with the
+        energy
+        \[
+          U(z) \;=\; \Bigl[-\log p\bigl(y \mid g_\theta(z)\bigr) + \tfrac{\|z\|^2}{2\tau^2}\Bigr] / T,
+        \]
+        $T = \tau = 1$ the posterior itself, $\tau < 1$ a cooled prior
+        (the latent truncation of step 10's samplers, as a target rather
+        than a post-hoc clamp), $T < 1$ the tempered posterior. Each
+        iteration draws a momentum $p \sim \mathcal{N}(0, I)$, integrates
+        $L$ leapfrog steps of size $\varepsilon$ and accepts the end point
+        with probability $\min(1, e^{H_0 - H_1})$; a non-finite trajectory
+        is rejected. $\varepsilon$ is per chain, scaled by
+        $U(0.8, 1.2)$ every iteration, and adapted during the first part of
+        the burn-in by $\log\varepsilon \mathrel{+}= r_k\,(\alpha_k - 0.65)$
+        with $\alpha_k$ the acceptance probability and $r_k$ decaying
+        linearly from 0.2 to 0.05, then frozen. $L = 1$ would be MALA. The
+        gradient of $U$ is one differentiable reverse
+        (\texttt{invlib.FastReverse}, the compiled per-token CUDA graphs of
+        step 11) and one forward of the measurement model; all systems
+        $\times$ variants $\times$ chains run as one batch.
+  \item \textbf{Deviation, recorded: MALA first.} The first pilot (200
+        steps, batch 90, five variants including chains started from a
+        prior sample) used MALA. Its step size adapted down to $h = 6
+        \times 10^{-5}$ with acceptance still $\approx 0$ for denoising,
+        both inpaintings and $2\times$ super-resolution; only CT and
+        $4\times$ SR reached 0.3--0.4; from a prior sample nothing moved at
+        all ($U \sim 10^4$--$10^5$, every proposal rejected). The posterior
+        in $z$ is stiff along the measured directions (curvature $\sim
+        s_i^2/\sigma^2$ for a Jacobian singular value $s_i$ of $g_\theta$)
+        and unit-curvature along the rest, and MALA's cost per independent
+        sample grows with that condition number where HMC's grows with its
+        square root. Hence HMC, and no prior-sample variant. The pilot's
+        log and json are kept under
+        \texttt{outputs/step16\_latent\_langevin/pilot\_mala/}; a display
+        bug of the pilot (the residual column divided by $\sigma^2$ twice)
+        affected only the printed residuals, not the objective.
+  \item \textbf{Initialisations and variants (the operating-point sweep).}
+        Chains start from the step-14 latent MAP (the lowest-$J_z$ restart,
+        read from \texttt{gallery\_N\_solutions.pt}) or from a latent
+        maximum-likelihood point: Adam on the data term alone, 300 steps at
+        lr 0.02, from the MAP, which walks out along the measured directions
+        until it over-fits the noise (residuals 0.15--0.69 $M\sigma^2$) and
+        lands on the typical shell ($\|z\|$ 24--34 against $\sqrt n = 32$).
+        The main run: three variants $\times$ six systems $\times$ three
+        chains $= 54$ rows, $\{$posterior from the MAP, posterior from the
+        MLE, cooled prior $\tau = 0.7$ from the MAP$\}$, 160 iterations of
+        $L = 16$ leapfrog steps, burn-in 60 (adaptation 50), $\varepsilon_0
+        = 10^{-2}$. The follow-up (\texttt{\_stiff}): the four stiff
+        systems only, from the MAP and the MLE, two chains, 30 iterations
+        of $L = 128$, burn-in 10 (adaptation 8), $\varepsilon_0 = 2.5
+        \times 10^{-3}$ (where the main run's adaptation ended for those
+        systems) --- 3,840 gradients on a batch of 16, sized to finish in
+        about 40 minutes next to the 128-px training. Chains of one (system,
+        variant) share the initial state and differ in their noise.
+  \item \textbf{What is recorded.} After every iteration: $U$, the data
+        term, $\|z\|$, PSNR of $g_\theta(z)$, acceptance and its
+        probability, $\varepsilon$, and the image itself (fp16) for every
+        row. Per (system, variant): acceptance in burn-in and sampling,
+        $U$ against $U(f_\theta(x_{\rm true}))$, the residual
+        $\|y - Ax\|^2/(M\sigma^2)$, $\|z\|$, PSNR of the last state of each
+        chain, of the samples on average and of the posterior mean over the
+        sampling phase (all chains pooled), the pixel-wise posterior std,
+        the distance moved from the initialisation and the spread of the
+        chains. The videos show, per system, the three chains of each
+        variant, the running posterior mean (sampling phase) with its PSNR,
+        and the running std, one frame per iteration.
+  \item \textbf{Claims, made before the run.} (i) From the latent MAP the
+        chains leave it: $\|z\|$ grows from the MAP's 6--25 towards
+        $\sqrt n = 32$, the residual rises from the MAP's noise-fitted
+        0.5--0.9 $M\sigma^2$ towards 1, and the samples show lung texture
+        that the MAP lacks. (ii) The running posterior mean is smoother
+        than any sample and its PSNR is higher than the samples' and than
+        the MAP's --- the MMSE estimator, which is what Matt's ``it's
+        averaging all possible things'' describes; whether it is blurrier
+        \emph{than the MAP} is the question. (iii) The stiff systems mix
+        slowly at $L = 16$ (the chain moves $L\varepsilon \approx 0.05$ per
+        iteration along the unmeasured directions and must cross $\sim 1$);
+        the $L = 128$ follow-up moves them further. (iv) The MLE start is
+        already on the shell and its chains reach a stable $\|z\|$ sooner;
+        from the two starts the sampling-phase means agree where the chains
+        mix and differ where they do not. (v) $\tau = 0.7$ pulls $\|z\|$
+        to $\approx 0.7\sqrt n$ and gives smoother samples with higher PSNR
+        than $\tau = 1$ --- the usual truncation trade-off, with no
+        guarantee about which the eye prefers.
+\end{itemize}
+
+\subsection{Configuration (verbatim)}
+{\small\verbatiminput{../configs/step16_latent_langevin.yml}}
+{\small\verbatiminput{../configs/step16_latent_langevin_stiff.yml}}
+
+\subsection{Results}
+Each line reports, per system and variant, the sampling-phase acceptance,
+$\|z\|$ of the final states, the PSNR of the samples on average and of the
+posterior mean.
+
+\InputIfFileExists{../outputs/step16_latent_langevin/data/summary.tex}{}
+  {\emph{not generated yet -- run \texttt{python step16\_latent\_langevin.py --res 32}.}}
+
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32.png}
+\caption{32 px, the posterior from the latent MAP ($L = 16$): truth,
+measurement, the initial state, the last state of the three chains, the
+posterior mean and std over the sampling phase.}
+\label{fig:step16gallery32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_variants.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_variants.png}
+\caption{32 px, the operating points: for each variant the last state of
+chain 1 and the posterior mean.}
+\label{fig:step16variants32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_traces.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_traces.png}
+\caption{32 px, traces (mean over chains): $U - U(z_{\rm true})$, the
+residual in units of $M\sigma^2$, $\|z\|$, PSNR and the windowed
+acceptance.}
+\label{fig:step16traces32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_stiff.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_stiff.png}
+\caption{32 px, the stiff systems with $L = 128$ leapfrog steps per
+iteration.}
+\label{fig:step16stiff32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_stiff_traces.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_stiff_traces.png}
+\caption{32 px, traces of the $L = 128$ run.}
+\label{fig:step16stifftraces32}
+\end{figure}}{}
+\clearpage
+
+\subsection{Analysis}
+\label{sec:step16analysis}
+\begin{itemize}
+  \item \textbf{The sampler works; the cost is the flow's reverse.} Every
+        one of the 54 chains reached the target acceptance: 0.41--0.90 in
+        the sampling phase, with the step size adapted per system to
+        $1.2$--$1.6 \times 10^{-3}$ (box), $1.6$--$2.2 \times 10^{-3}$
+        (random), $3$--$4 \times 10^{-3}$ (denoising, $2\times$ SR),
+        $4.5 \times 10^{-3}$--$1.8 \times 10^{-2}$ ($4\times$ SR) and
+        $1.1$--$2.2 \times 10^{-2}$ (CT) --- a ten-fold spread that is the
+        stiffness of the measured directions, and which the MALA pilot
+        could not live with. One gradient of $U$ (a differentiable
+        reverse of the flow for the batch of 54) cost 1.21 s next to the
+        128-px training, 19.3 s per iteration of 16 leapfrog steps, 52
+        minutes for 2,560 gradients; the MLE initialisation (300 Adam
+        steps on a batch of 6) took 119 s. A chain decorrelates along the
+        unmeasured, unit-curvature directions after travelling a distance
+        of order one, i.e.\ after $\sim 1/\varepsilon$ gradients: 60--80
+        gradients for CT, 300--800 for the stiff four. That single number
+        decides everything below.
+  \item \textbf{Claim (i), leaving the MAP: confirmed for CT and $4\times$
+        SR, not reached for the other four.} From the latent MAP, $\|z\|$
+        went $12.1 \to 31.6$--$32.3$ for CT and $5.7 \to 27.7$--$31.4$ for
+        $4\times$ SR, the residual from 0.84 to 0.92--1.01 and from 0.53 to
+        0.69--0.77 $M\sigma^2$, and the chains moved 27--31 from their
+        start --- against $\sqrt{32^2 + \|z_0\|^2} \approx 32$--$34$ for an
+        independent point of the shell, i.e.\ they have forgotten where
+        they began. Their $U$ ends at or above the truth's (CT 763--780
+        vs.\ 634; $4\times$ SR 273--384 vs.\ 314): a typical posterior
+        point, not a dense one. The four stiff systems did not get there
+        in 160 iterations: $\|z\|$ $15.6 \to 21.8$--$24.6$ (denoising),
+        $20.3 \to 20.9$--$21.6$ (box), $16.3 \to 17.0$--$18.5$ (random),
+        $11.5 \to 18.1$--$21.1$ ($2\times$ SR); their $U$ is still
+        100--350 nats \emph{below} the truth's (denoising 223--289 vs.\
+        507, box $-1204$ to $-1171$ vs.\ $-1021$, random $-370$ to $-334$
+        vs.\ 10, $2\times$ SR $-246$ to $-191$ vs.\ $-33$), and the box
+        and random chains moved only 5--9 from their start. The traces
+        say the same in two ways: $\|z\|$ of denoising and $2\times$ SR is
+        still rising with no plateau at iteration 160, and box and random
+        are flat at a value that is not the shell --- the chain is
+        trapped by the step size, not converged. Those four are the
+        \texttt{\_stiff} run's business. The residuals do move in the
+        claimed direction everywhere (0.56--0.86 at the MAP to 0.78--0.96
+        at the end), which is the noise-fitting of the latent MAP being
+        undone.
+  \item \textbf{Claim (ii), the mean and the samples --- Matt's question
+        answered.} Per row, the posterior mean beats the samples by
+        0.1--2.2 dB (denoising 23.3 vs.\ 25.0, box 21.1 vs.\ 21.2, random
+        23.4 vs.\ 23.6, $2\times$ SR 25.9 vs.\ 26.8, $4\times$ SR 23.4 vs.\
+        25.6, CT 25.3 vs.\ 27.0; samples first), the MMSE ordering. Against
+        the latent MAP (step 14: 23.0, 21.6, 23.5, 25.9, 25.3, 27.6 dB) the
+        posterior mean is \emph{higher} in four of six (denoising $+2.0$,
+        random $+0.1$, $2\times$ SR $+0.9$, $4\times$ SR $+0.3$) and lower
+        in box ($-0.4$) and CT ($-0.6$). The samples themselves: within
+        0.5 dB of the MAP where the chains stayed near it (denoising
+        $+0.3$, random $-0.1$, $2\times$ SR $0.0$, box $-0.5$) and 1.9--2.3
+        dB below it where they reached the shell ($4\times$ SR, CT) ---
+        the price of being a draw rather than an estimate. What the
+        figures show is the thing the numbers cannot: the chain finals
+        have speckled parenchyma, vessel dots and a crisp chest wall; the
+        latent MAP is smooth; the posterior mean is smooth again. So the
+        hypothesis ``the MAP is the mean, hence the blur'' is half right
+        and half wrong for this model. Right: the mean \emph{is} smooth,
+        and it is the higher-PSNR object. Wrong about the mechanism: the
+        latent MAP is not blurry because it averages --- it is a mode, not
+        a mean --- it is blurry because it sits at $\|z\|$ 6--20, and the
+        generator maps small-norm latents to smooth images (step 10's
+        temperature effect, arrived at by optimisation instead of by
+        choice). A posterior sample at $\|z\| \approx 32$ has the texture
+        back, and costs 0--2.3 dB of PSNR for it. If one wants a single
+        sharp image, neither the MAP nor the mean is it; a sample is, and
+        a sample is what the videos show.
+  \item \textbf{Claim (iii), stiffness: confirmed}, as the numbers of (i)
+        already say; the per-iteration displacement $L\varepsilon \approx
+        0.02$--$0.07$ for the stiff four is the whole explanation, and
+        the first iteration of the $L = 128$ run moved denoising from
+        $\|z\|$ 15.6 to 17.1 and $2\times$ SR from 11.5 to 13.9 --- what
+        took the $L = 16$ run 20--30 iterations.
+  \item \textbf{Claim (iv), the MLE start: on the shell from the first
+        step, and a mixing check that passes where it should.} The MLE
+        chains stay at $\|z\|$ 32.4--33.7 throughout (24.8--25.5 for
+        random, whose MLE sat at 24.3). Where the MAP chains reached the
+        shell the two starts agree: CT posterior means 27.0 vs.\ 27.0 dB,
+        chain $U$ 762--830 from both, $\|z\|$ 31.5--33.7 from both;
+        $4\times$ SR 25.6 vs.\ 24.9 dB, $U$ 273--406. Where they did not,
+        the two starts have not met (box: $\|z\|$ 21 vs.\ 33 and $U$
+        $-1190$ vs.\ $-900$; $2\times$ SR: 20 vs.\ 33 and $-220$ vs.\
+        $+90$), which is the honest statement that neither has converged.
+        The MLE start also keeps a trace of its noise-fitting: residuals
+        0.60--0.69 ($2\times$ SR), 0.66--0.80 (random), 0.85--0.87 (box)
+        at the end, still rising in the traces, against 0.83--0.96 from
+        the MAP. Its chains adapted to a larger step size than the MAP
+        chains on denoising and box ($5$--$8 \times 10^{-3}$ vs.\ $3$--$4
+        \times 10^{-3}$; $3.3 \times 10^{-3}$ vs.\ $1.4 \times 10^{-3}$):
+        the posterior is less curved on the shell than in the basin. The
+        PSNR of the MLE-start means is 0.3--1.2 dB below the MAP-start
+        means everywhere except box and random (where it is 0.3--0.5 dB
+        above), so for a single run the MAP start is the better operating
+        point and the MLE start is the check on it.
+  \item \textbf{Claim (v), $\tau = 0.7$: confirmed where it could act.}
+        For CT and $4\times$ SR the cooled chains settle at $\|z\|$
+        22--24 $\approx 0.7\sqrt n$, and give the best numbers in the
+        table: samples 26.2 dB (CT; $+0.9$ over $\tau = 1$) and 24.2 dB
+        ($4\times$ SR; $+0.8$), means 27.6 and 25.5 dB. For the stiff four
+        the cooling changed nothing (within 0.3 dB, same $\|z\|$) because
+        those chains never reached the radius at which the prior term
+        differs. The posterior std maps (0.013--0.057 in the $[-1, 1]$
+        pixel units, largest for denoising and $4\times$ SR, smallest for
+        the inpaintings where the std is confined to the missing pixels)
+        shrink under $\tau = 0.7$ where the cooling acted (CT 0.038 to
+        0.031, $4\times$ SR 0.057 to 0.041) and not where it did not
+        (denoising 0.057 to 0.053, box and random unchanged), as a
+        narrower prior should make them.
+  \item \textbf{Operating point, as of the main run.} HMC, $L = 16$,
+        $\varepsilon$ adapted to 0.65 acceptance, from the latent MAP,
+        $T = 1$: correct and converged for CT and $4\times$ SR in 160
+        iterations (52 min shared); $\tau = 0.7$ if one is willing to
+        trade a narrower posterior for $+0.8$ dB. For denoising, both
+        inpaintings and $2\times$ SR the same sampler needs longer
+        trajectories --- the \texttt{\_stiff} run, below. What the videos
+        show, checked frame by frame on CT and on the last frame of
+        denoising: three chains that differ from each other in the
+        parenchymal detail and agree on the anatomy, a running mean that
+        settles within the first 30 sampling iterations, a running std
+        concentrated on vessels and the chest wall (CT) or spread over the
+        lung fields (denoising).
+  \item \textbf{The $L = 128$ run (\texttt{\_stiff}): the stiff four reach
+        the shell, two of them within the budget.} Same sampler, same
+        target, 128 leapfrog steps per iteration, 30 iterations, two
+        chains, from the MAP and from the MLE; 35 min shared with the
+        128-px training (0.54 s per gradient at batch 16). The adapted
+        step sizes are the main run's ($2.5$--$3.5 \times 10^{-3}$ for
+        denoising and $2\times$ SR, $1.4$--$2.3 \times 10^{-3}$ for box,
+        $1.7$--$2.0 \times 10^{-3}$ for random), so one iteration now
+        moves $L\varepsilon \approx 0.2$--$0.4$ instead of 0.02--0.07, and
+        the first iteration did what the main run's first 20--30 did
+        (claim (iii)). Denoising and $2\times$ SR converge: from $\|z\|$
+        15.6 and 11.5 both chains sit at 31.1--32.1 and 32.0 by iteration
+        25, having moved 29--32 units --- the whole way to the shell; the
+        residual ratios are 0.96--0.99 and 0.81--0.92; the chain energies
+        bracket the truth's for denoising ($U$ 494 and 545 against 507)
+        and sit 116--130 nats above it for $2\times$ SR ($U$ 84 and 97
+        against $-33$, with data terms $-428$ and $-414$ bracketing the
+        truth's $-423$) --- the CT and $4\times$ SR picture of the main
+        run. The MLE start agrees on denoising: $\|z\|$ 30.7--32.4, $U$
+        491--555, means 26.7 vs.\ 26.1 dB, and its chains ended 40--41
+        units from where they started, farther than their own norm, i.e.\
+        at an unrelated point of the shell. On $2\times$ SR the MLE start
+        has not forgotten its noise-fitting: one chain still has residual
+        0.68, a data term 21 nats below the truth's and a pixel at 1.69,
+        and the two means differ (26.6 vs.\ 29.0 dB), so for $2\times$ SR
+        only the MAP start is converged. Box and random inpainting are not
+        there in 30 iterations. The MAP chains climbed from $\|z\|$ 20.3
+        to 26.4--28.2 (box) and from 16.3 to 23.5--26.4 (random), still
+        rising linearly in the traces; the box energies straddle the
+        truth's ($-978$ and $-1034$ against $-1021$) but the MLE chains
+        sit at $-848$ to $-903$ and $\|z\|$ 32--33, so the two starts are
+        5--6 units and 100 nats apart; random is 130--200 nats below the
+        truth from both starts, with acceptance 0.38--0.45 at
+        $\varepsilon \approx 2 \times 10^{-3}$ (the adaptation froze after
+        8 iterations, before the step size had come down to the 0.65
+        target). At the present rate box needs roughly 20 more
+        iterations and random 40--60, i.e.\ another 25--70 min at this
+        batch. The reconstructions change the picture of claim (ii) for
+        these systems: the samples on the shell are \emph{above} the
+        latent MAP in PSNR --- denoising 24.1--24.2 against 23.0, box
+        22.0--22.2 against 21.6, random 23.6--23.9 against 23.5, $2\times$
+        SR 26.6--26.7 against 25.9 --- and the posterior means (40 samples
+        each) are 26.1, 22.7, 24.3 and 29.0 dB: $+3.1$, $+1.1$, $+0.8$ and
+        $+3.1$ dB over the MAP, and $+1.1$, $+1.5$, $+0.7$ and $+2.2$ dB
+        over the main run's means, which averaged a neighbourhood of the
+        MAP rather than the posterior. The gain is largest where the MAP
+        sits deepest in the basin ($\|z\|$ 11.5 for $2\times$ SR, 15.6
+        for denoising), so the $-1.9$ to $-2.3$ dB of CT and $4\times$ SR
+        is not a rule: on one image per system, the sign depends on the
+        problem. The videos show what the stills do --- two chains that
+        agree on the anatomy and differ in the parenchyma; for box
+        inpainting the two chains draw visibly different lung boundaries
+        inside the missing square and the std map is confined to it
+        (mean std 0.027, against 0.060 for denoising, 0.032 for random
+        and 0.037 for $2\times$ SR). The RMS distance between the two
+        chains' final images is 0.10--0.14 in $[-1, 1]$ units.
+  \item \textbf{Operating point, revised.} HMC from the latent MAP, $T =
+        \tau = 1$, $\varepsilon$ adapted to 0.65 acceptance, with $L$
+        chosen by the stiffness of the system: $L = 16$ for CT and
+        $4\times$ SR (converged in 160 iterations; 52 min for three chains
+        on six systems), $L = 128$ for denoising and $2\times$ SR (30
+        iterations, the last 25 on the shell; 35 min for two chains on
+        four systems), $L = 128$ and 50--90 iterations for the inpaintings
+        (not yet run to convergence). The MLE start is the mixing check;
+        it passes on denoising and, in the main run, on CT and $4\times$
+        SR. The cooled prior $\tau = 0.7$ is the option for a sharper
+        single sample at the price of a narrower posterior, tested on CT
+        and $4\times$ SR only. All PSNR numbers in this section are for
+        one image per system.
+%% STEP16_ANALYSIS_32_STIFF_MORE
+\end{itemize}
+
+
 \section{Reproducibility}
 \begin{itemize}
   \item Global seed \texttt{20260831} (config) seeds torch, numpy, and every

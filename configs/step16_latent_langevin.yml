@@ -1,0 +1,53 @@
+# step16_latent_langevin.py -- random walks on the posterior, in latent space only.
+# The target is p(z | y) \propto p(y | g(z)) N(z; 0, I) (exact: x = g(z) is a bijection,
+# so the Jacobian cancels and no log-determinant appears). The chain is Hamiltonian
+# Monte Carlo on z -- `leapfrog` steps of size eps per iteration, eps adapted per chain
+# during the burn-in towards `target_accept` and frozen afterwards; `leapfrog: 1` is
+# MALA -- and the state x = g(z) is recorded after every iteration for one mp4 per
+# system. The problems (operators, measurements, test slices) are the stored step-14
+# ones; `--res N` picks the rung.
+#
+# Operating-point sweep (all in one batch: systems x variants x chains): the exact
+# posterior from two initialisations -- the step-14 latent MAP (lowest-J_z restart) and
+# a latent maximum-likelihood point (Adam on the data term alone, started from the
+# MAP) -- and a cooled target from the MAP, prior temperature tau < 1
+# (||z||^2 / (2 tau^2), latent truncation); an overall temperature T < 1 (U / T, the
+# tempered posterior) is also available. T = tau = 1 is the posterior itself.
+#
+# Deviation, recorded. The first pilot (200 steps, batch 90) used MALA with five
+# variants including chains started from a prior sample: the step size adapted down to
+# 6e-5 with acceptance still ~0 for denoising, inpainting and 2x super-resolution (the
+# posterior in z is stiff along the measured directions, wide along the rest), only CT
+# and 4x super-resolution reached acceptance 0.3-0.4, and from a prior sample nothing
+# moved at all (U ~ 1e4-1e5, every proposal rejected). Hence HMC (its cost per
+# independent sample scales with the square root of the condition number, MALA's with
+# the condition number), and no prior-sample variant. The pilot's log is kept under
+# outputs/step16_latent_langevin/pilot_mala/.
+
+seed: 20260904
+output_root: outputs/step16_latent_langevin
+step14_config: configs/step14_lidc_gallery.yml     # priors, systems, seeds; solutions under its output_root
+
+chains: 3                       # independent chains per (system, variant); same init, different noise
+iterations: 160                 # HMC iterations (each `leapfrog` gradient evaluations)
+leapfrog: 16                    # leapfrog steps per iteration (1 = MALA)
+burn_in: 60                     # iterations before this are not used for the posterior mean/std
+adapt_iters: 50                 # step-size adaptation window (within the burn-in)
+target_accept: 0.65             # HMC's usual target (0.574 for MALA)
+eps0: 1.0e-2                    # initial leapfrog step size (the MALA pilot's h = eps^2/2 ~ 6e-5)
+adapt_rate: 0.2                 # log eps += rate * (acceptance probability - target) per iteration;
+                                # the rate decays linearly to a quarter over adapt_iters
+eps_jitter: 0.2                 # eps scaled by U(1 - j, 1 + j) each iteration (breaks periodic orbits)
+
+mle:                            # the latent maximum-likelihood initialisation
+  steps: 300                    # Adam on the data term alone, from the latent MAP
+  lr: 2.0e-2
+
+variants:
+  - {name: posterior_from_map, init: map, temperature: 1.0, prior_scale: 1.0}
+  - {name: posterior_from_mle, init: mle, temperature: 1.0, prior_scale: 1.0}
+  - {name: cool_prior_0.7,     init: map, temperature: 1.0, prior_scale: 0.7}
+
+video:
+  fps: 8
+  dpi: 100

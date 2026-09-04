@@ -129,8 +129,10 @@ def system_params(spec, N):
     return kw, sigma
 
 
-def make_problem(spec, x, gen):
-    """y = A x + sigma eps (noise only on measured coordinates) and the exact -log p(y|x)."""
+def make_problem(spec, x, gen, y=None):
+    """y = A x + sigma eps (noise only on measured coordinates) and the exact -log p(y|x).
+    With `y` given (a stored measurement, e.g. step 15 re-using this gallery's problems)
+    no noise is drawn and the generator is untouched."""
     N = x.shape[-1]
     kw, sigma = system_params(spec, N)
     if spec["name"] == "ct":
@@ -138,12 +140,14 @@ def make_problem(spec, x, gen):
     else:
         op = measlib.build(spec["name"], tuple(x.shape[1:]), sigma=sigma, **kw)
     Ax = apply_A(op, x)
-    eps = torch.randn(Ax.shape, generator=gen).to(x.device)
+    eps = None if y is not None else torch.randn(Ax.shape, generator=gen).to(x.device)
     if isinstance(op, measlib._IdentityBasis):
         mask = op.sing(x.device, x.dtype).unsqueeze(0)
-        y, M = mask * (x + sigma * eps), int(mask.sum())
+        M = int(mask.sum())
+        y = mask * (x + sigma * eps) if eps is not None else y.to(x.device)
     else:
-        y, M = Ax + sigma * eps, int(Ax[0].numel())
+        M = int(Ax[0].numel())
+        y = Ax + sigma * eps if eps is not None else y.to(x.device)
     const = 0.5 * M * math.log(2 * math.pi * sigma ** 2)
 
     def nll(xx):

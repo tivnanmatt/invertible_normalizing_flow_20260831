@@ -1,0 +1,40 @@
+# step16_latent_langevin.py, second configuration: long trajectories for the stiff systems.
+# The main run (configs/step16_latent_langevin.yml, 16 leapfrog steps) adapted the step
+# size to 1.5e-3 -- 4e-3 for denoising, both inpaintings and 2x super-resolution (the
+# measured directions are stiff), so one iteration moves the chain by L*eps ~ 0.05 along
+# the unmeasured, prior-scale directions and 100 iterations diffuse ~0.5 of the unit they
+# must cross: those chains explore the neighbourhood of the MAP, not the posterior. Same
+# sampler, same target, eight times longer trajectories (128 leapfrog steps, ~0.3 per
+# iteration), fewer iterations; only those four systems, from the latent MAP and from the
+# latent MLE. Output files carry the tag `_stiff`. Trimmed to two chains and 30 iterations
+# (3,840 gradients, batch 16) so that it finishes in ~40 min while sharing the GPU with the
+# 128-px training; the adaptation starts where the main run's ended, so ten iterations of
+# burn-in are enough to settle the step size.
+
+seed: 20260904
+output_root: outputs/step16_latent_langevin
+step14_config: configs/step14_lidc_gallery.yml
+tag: _stiff
+systems: [denoise, inpaint_box, inpaint_random, sr_2x]
+
+chains: 2
+iterations: 30
+leapfrog: 128
+burn_in: 10
+adapt_iters: 8
+target_accept: 0.65
+eps0: 2.5e-3                    # where the main run's adaptation ended for these systems
+adapt_rate: 0.2
+eps_jitter: 0.2
+
+mle:
+  steps: 300
+  lr: 2.0e-2
+
+variants:
+  - {name: posterior_from_map, init: map, temperature: 1.0, prior_scale: 1.0}
+  - {name: posterior_from_mle, init: mle, temperature: 1.0, prior_scale: 1.0}
+
+video:
+  fps: 4
+  dpi: 100

@@ -5,11 +5,14 @@ For the prior at one resolution (--res 32/64/128/256) and one held-out test slic
 system: denoising, box inpainting, random-pixel inpainting, 2x and 4x super-resolution,
 sparse-view CT. Each is solved by latent-space MAP -- Adam on z with x = g_theta(z)
 through the CUDA-graph sequential reverse (invlib.FastReverse), objective
-J_z(z) = -log p(y | g(z)) - log N(z; 0, I), several independent random restarts as one
-batch -- which is the step-11 estimator with the schedule the step-11 learning-rate sweep
-picked (lr 0.1 -> 0.005, cosine). The restarts are NOT posterior samples: they are
-local optima of the MAP objective from different inits; their spread is a
-(lower-bound) hint of multimodality only.
+J_z(z) = -log p(y | g(z)) - log N(z; 0, I), several independent random restarts -- which
+is the step-11 estimator with the schedule the step-11 learning-rate sweep picked
+(lr 0.1 -> 0.005, cosine). All systems' restarts are optimised together as ONE batch
+(6 x 3 = 18 rows): the sequential reverse is latency-bound, so this costs the same per
+step as a single system, and since Adam is elementwise and the objective a sum over
+rows it is exactly the independent optimisations. The restarts are NOT posterior
+samples: they are local optima of the MAP objective from different inits; their
+spread is a (lower-bound) hint of multimodality only.
 
 Every likelihood uses the exact forward operator: pixel masks, 2^L x 2^L average pooling,
 and a matrix-free pixel-driven parallel-beam Radon transform (RadonOp, identical to
@@ -201,67 +204,91 @@ def run(cfg, res, device, out_data, out_figs):
     gen = torch.Generator().manual_seed(cfg["seed"])
     indices = torch.randperm(len(test), generator=gen)[:len(systems)].tolist()
     tag = f"[step14:{res}]"
-    print(f"{tag} prior {ckpt} (T={T}, D={D}); test slices {indices} of {len(test)}", flush=True)
+    S = len(systems)
+    print(f"{tag} prior {ckpt} (T={T}, D={D}); test slices {indices} of {len(test)}; "
+          f"{S} systems x {R} restarts = one batch of {S * R}", flush=True)
+    # the sequential reverse is latency-bound (a token step costs the same at batch 3 and
+    # batch 18), so all systems' restarts are optimised together as one batch: Adam is
+    # elementwise and the objective is a sum over rows, so this is exactly the R
+    # independent optimisations per system, S times, for the price of one
     torch.cuda.synchronize()
     t0 = time.time()
-    fr = invlib.FastReverse(prior, R, device, mode="compile")
+    reverse = cfg.get("reverse", "fast")
+    if reverse == "fast2":        # in-place cache (invlib.FastReverse2): O(B T) traffic per token step, not O(B T^2)
+        fr = invlib.FastReverse2(prior, S * R, device, chunk=int(cfg.get("chunk", 128)), mode="graph")
+    else:
+        fr = invlib.FastReverse(prior, S * R, device, mode="compile")
     torch.cuda.synchronize()
     build_s = time.time() - t0
-    print(f"{tag} graph build {build_s:.1f} s", flush=True)
+    print(f"{tag} graph build {build_s:.1f} s ({reverse})", flush=True)
+
+    probs, x_trues, z0 = [], [], []
+    for r, (spec, idx) in enumerate(zip(systems, indices)):
+        x_true = test[idx][0].unsqueeze(0).to(device)
+        probs.append(make_problem(spec, x_true, gen))
+        x_trues.append(x_true)
+        torch.manual_seed(cfg["seed"] + 100 * r)
+        z0.append(torch.randn(R, T, D, device=device))
+    z = torch.cat(z0).requires_grad_(True)
+    sl = lambda s: slice(s * R, (s + 1) * R)                                    # rows of system s
+
+    def data_terms(x):
+        return torch.cat([p["nll"](x[sl(s)]) for s, p in enumerate(probs)])
+
+    opt = torch.optim.Adam([z], lr=cfg["lr"])
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=K, eta_min=cfg["lr_min"])
+    J_tr, ts = np.zeros((K, S * R)), []
+    torch.cuda.synchronize()
+    t_all = time.time()
+    for k in range(K):
+        t1 = time.time()
+        x, _ = fr(z)
+        J = data_terms(x) + s11.neg_log_normal(z)
+        opt.zero_grad(set_to_none=True)
+        J.sum().backward()
+        opt.step()
+        sched.step()
+        torch.cuda.synchronize()
+        ts.append(time.time() - t1)
+        J_tr[k] = J.detach().cpu().numpy()
+        if k % 100 == 0 or k == K - 1:
+            print(f"{tag} step {k:4d}: best-restart J per system "
+                  + " ".join(f"{p['name']} {float(J[sl(s)].min()):9.1f}" for s, p in enumerate(probs))
+                  + f"  lr {sched.get_last_lr()[0]:.4f}  {ts[-1]:.2f} s/step", flush=True)
+    total = time.time() - t_all
+    with torch.no_grad():
+        x, _ = fr(z)
+        data = data_terms(x)
+        J = data + s11.neg_log_normal(z)
 
     rows, store = [], {}
-    for r, (spec, idx) in enumerate(zip(systems, indices)):
+    for s, (spec, idx, prob, x_true) in enumerate(zip(systems, indices, probs, x_trues)):
         name = spec["name"]
-        x_true = test[idx][0].unsqueeze(0).to(device)
-        prob = make_problem(spec, x_true, gen)
-        torch.manual_seed(cfg["seed"] + 100 * r)
-        z = torch.randn(R, T, D, device=device).requires_grad_(True)
-        opt = torch.optim.Adam([z], lr=cfg["lr"])
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=K, eta_min=cfg["lr_min"])
-        J_tr, ts = np.zeros((K, R)), []
-        torch.cuda.synchronize()
-        t_all = time.time()
-        for k in range(K):
-            t1 = time.time()
-            x, _ = fr(z)
-            J = prob["nll"](x) + s11.neg_log_normal(z)
-            opt.zero_grad(set_to_none=True)
-            J.sum().backward()
-            opt.step()
-            sched.step()
-            torch.cuda.synchronize()
-            ts.append(time.time() - t1)
-            J_tr[k] = J.detach().cpu().numpy()
-            if k % 100 == 0 or k == K - 1:
-                print(f"{tag} {name:15s} step {k:3d}: J " + " ".join(f"{float(j):10.1f}" for j in J.detach())
-                      + f"  lr {sched.get_last_lr()[0]:.4f}  {ts[-1]:.2f} s", flush=True)
-        total = time.time() - t_all
+        xs, zs, Js, ds = x[sl(s)], z.detach()[sl(s)], J[sl(s)], data[sl(s)]
         with torch.no_grad():
-            x, _ = fr(z)
-            data = prob["nll"](x)
-            J = data + s11.neg_log_normal(z)
             data_true = prob["nll"](x_true)
             zt, _, _ = prior(x_true)
             J_true = float(data_true[0] + s11.neg_log_normal(zt)[0])
-            ps = psnr01(x, x_true.expand_as(x))
+            ps = psnr01(xs, x_true.expand_as(xs))
         row = dict(model=name, params=prob["params"], index=int(idx), M=prob["M"], sigma=prob["sigma"],
                    noise_level=float(prob["noise_level"]), data_true=float(data_true[0]), J_true=J_true,
-                   J=[float(v) for v in J], data=[float(v) for v in data], psnr=[float(v) for v in ps],
-                   z_norm=[float(v) for v in z.detach().flatten(1).norm(dim=-1)],
-                   max_abs=[float(v) for v in x.flatten(1).abs().max(-1).values],
-                   pairwise_rms=float(((x[:, None] - x[None]) ** 2).mean((2, 3, 4)).sqrt().sum() / (R * (R - 1))),
-                   seconds=total, step_seconds=float(np.mean(ts)), J_min_over_steps=[float(v) for v in J_tr.min(0)])
+                   J=[float(v) for v in Js], data=[float(v) for v in ds], psnr=[float(v) for v in ps],
+                   z_norm=[float(v) for v in zs.flatten(1).norm(dim=-1)],
+                   max_abs=[float(v) for v in xs.flatten(1).abs().max(-1).values],
+                   pairwise_rms=float(((xs[:, None] - xs[None]) ** 2).mean((2, 3, 4)).sqrt().sum() / (R * (R - 1))),
+                   seconds=total, step_seconds=float(np.mean(ts)), J_min_over_steps=[float(v) for v in J_tr[:, sl(s)].min(0)])
         rows.append(row)
-        store[name] = dict(x_true=x_true.cpu(), y=prob["y"].cpu(), x=x.cpu(), z=z.detach().cpu(), J_trace=J_tr, op=prob["op"])
+        store[name] = dict(x_true=x_true.cpu(), y=prob["y"].cpu(), x=xs.cpu(), z=zs.cpu(), J_trace=J_tr[:, sl(s)], op=prob["op"])
         print(f"{tag} {name:15s} #{idx}: {total:.0f} s ({row['step_seconds']:.2f} s/step); J {['%.0f' % v for v in row['J']]} "
               f"(truth {J_true:.0f}); data {['%.0f' % v for v in row['data']]} (truth {row['data_true']:.0f}, noise level "
               f"{row['noise_level']:.0f}); PSNR {['%.1f' % v for v in row['psnr']]}; |z| {['%.1f' % v for v in row['z_norm']]}; "
               f"pairwise RMS {row['pairwise_rms']:.3f}", flush=True)
-        res_json = dict(res=res, prior=str(ckpt), latent=dict(T=T, D=D), restarts=R, iters=K, lr=cfg["lr"], lr_min=cfg["lr_min"],
-                        seed=cfg["seed"], indices=indices, graph_build_seconds=build_s, rows=rows, sqrt_D=math.sqrt(T * D))
-        json.dump(res_json, open(out_data / f"gallery_{res}.json", "w"), indent=1)
-        torch.save({k: {kk: vv for kk, vv in v.items() if kk != "op"} for k, v in store.items()},
-                   out_data / f"gallery_{res}_solutions.pt")
+    res_json = dict(res=res, prior=str(ckpt), latent=dict(T=T, D=D), restarts=R, iters=K, lr=cfg["lr"], lr_min=cfg["lr_min"],
+                    seed=cfg["seed"], indices=indices, batch=S * R, reverse=reverse, graph_build_seconds=build_s, rows=rows,
+                    sqrt_D=math.sqrt(T * D))
+    json.dump(res_json, open(out_data / f"gallery_{res}.json", "w"), indent=1)
+    torch.save({k: {kk: vv for kk, vv in v.items() if kk != "op"} for k, v in store.items()},
+               out_data / f"gallery_{res}_solutions.pt")
 
     import matplotlib
     matplotlib.use("Agg")
@@ -319,13 +346,20 @@ def collect(cfg, out_data):
         g = json.load(open(p))
         parts = []
         for row in g["rows"]:
+            # everything is the lowest-objective restart (the one the method would pick); the best
+            # PSNR of the three is added only when another restart beats it (needs the truth)
             best = int(np.argmin(row["J"]))
+            ps, pmax = row["psnr"][best], max(row["psnr"])
+            psnr = f"PSNR {ps:.1f} dB" + (f" (best restart {pmax:.1f})" if pmax - ps >= 0.05 else "")
             parts.append(f"{_tex(row['model'])}: $J_z$ {min(row['J']):.0f} (truth {row['J_true']:.0f}), data {row['data'][best]:.0f} "
-                         f"(noise level {row['noise_level']:.0f}), PSNR {max(row['psnr']):.1f} dB, $\\|z\\|$ {row['z_norm'][best]:.0f} "
+                         f"(noise level {row['noise_level']:.0f}), {psnr}, $\\|z\\|$ {row['z_norm'][best]:.0f} "
                          f"(typical {g['sqrt_D']:.0f}), restart spread {row['pairwise_rms']:.3f}")
-        secs = sum(r["seconds"] for r in g["rows"])
-        lines.append(f"{res}$\\times${res} ($T={g['latent']['T']}$, $D={g['latent']['D']}$; {g['restarts']} restarts $\\times$ {g['iters']} steps, "
-                     f"{g['rows'][0]['step_seconds']:.2f} s per step, {secs / 60:.0f} min): " + "; ".join(parts) + ".")
+        # one batch for all systems (`batch` recorded) or, in the archived first runs, one after the other
+        secs = g["rows"][0]["seconds"] if "batch" in g else sum(r["seconds"] for r in g["rows"])
+        lines.append(f"{res}$\\times${res} ($T={g['latent']['T']}$, $D={g['latent']['D']}$; {g['restarts']} restarts $\\times$ {g['iters']} steps"
+                     + (f", all systems in one batch of {g['batch']}" if "batch" in g else "")
+                     + (", in-place cache" if g.get("reverse") == "fast2" else "")
+                     + f", {g['rows'][0]['step_seconds']:.2f} s per step, {secs / 60:.0f} min): " + "; ".join(parts) + ".")
     (out_data / "summary.tex").write_text("\n".join(lines) + "\n")
     return lines
 

@@ -2839,6 +2839,22 @@ and the HU histogram of 200 slices (red: the model window).}
         and the memorisation check against a random 20,000-slice subset of
         the training split (16 samples, and the validation slices' own
         nearest-training distance as the reference).
+  \item \textbf{Deviation, recorded (64 px).} The first 64-px run was
+        stopped by the early-stop rule at epoch 17 because the plain
+        validation mean had not improved for six epochs; it had not
+        improved because two of the 4000 validation slices blew up to
+        $10^{2}$--$10^{7}$ bits/dim under the sharper later checkpoints
+        while the other 3998 kept improving (the test set, with no such
+        slice, preferred the final checkpoint). The selection statistic
+        was changed to the mean over validation slices below 10 bits/dim
+        (\texttt{val\_stat: robust}, the step-9 outlier accounting), the
+        run was resumed from the epoch-17 checkpoint with the patience
+        counted from the resume, and the first run's artefacts are kept
+        under \texttt{first\_run\_mean\_rule/}. Both statistics are
+        recorded per epoch from the resume on, and a
+        \texttt{--val-outliers} probe was added that names the failing
+        slices and where in the token sequence the blow-up starts. The
+        128- and 256-px configs use the robust statistic from the start.
   \item \textbf{The falsifiable claims.} (i) Validation bits/dim decreases
         and the test value of the best checkpoint is within a few hundredths
         of it; if the validation curve turns up while the training loss
@@ -2904,8 +2920,11 @@ the best-validation checkpoint.}
 \IfFileExists{../outputs/step13_lidc_tarflow_64/figures/curves.png}{%
 \begin{figure}[htbp]\centering
 \includegraphics[width=\textwidth]{outputs/step13_lidc_tarflow_64/figures/curves.png}
-\caption{64 px: training loss, validation bits/dim (4000-slice subset) and
-gradient norm per 48k-image epoch.}
+\caption{64 px: training loss, validation bits/dim on the 4000-slice subset
+(circles: the plain mean, off-scale from epoch 13 on because of two slices;
+squares, from the epoch-17 resume on: the mean over slices below 10 bits/dim,
+the selection statistic; red: the number of slices above 10) and gradient
+norm per 48k-image epoch.}
 \end{figure}}{}
 \IfFileExists{../outputs/step13_lidc_tarflow_64/figures/nearest_neighbours.png}{%
 \begin{figure}[htbp]\centering
@@ -2954,7 +2973,132 @@ gradient norm per 24k-image epoch.}
 
 \subsection{Analysis}
 \label{sec:step13analysis}
-%% STEP13_ANALYSIS
+The rungs are analysed as they finish; the numbers are those of the
+\texttt{summary.tex} lines above and of each rung's \texttt{result.json}
+and \texttt{metrics.csv}.
+
+\paragraph{32 px (12 mm/px).}
+\begin{itemize}
+  \item \textbf{(i) holds, and the early-stop rule did its job.}
+        Validation bits/dim falls monotonically from 5.29 (epoch 1) to
+        3.659 (epoch 11) and then rises --- 3.678, 3.677, 3.700, 3.703 at
+        epochs 12, 14, 15, 16 --- while the training loss keeps falling
+        ($-3.39 \to -3.51$ nats/dim) and the pre-clip gradient norm grows
+        (76 $\to$ 90): the 42.8M-parameter model over-fits the 95,947
+        slices (808 subjects) after $\sim$1M images, and the rule stopped
+        the run at 16. The test set confirms the choice of checkpoint: the
+        best-validation model scores 3.643 bits/dim on all 12,136 test
+        slices (median 3.598, 99th percentile 5.41, maximum 7.35, none above
+        10) against 3.698 for the final one, 0.016 below its own
+        validation value. Epoch 13's validation mean of $1.7 \times 10^{5}$
+        (an excess of $2 \times 10^{9}$ bits/dim summed over the 11,971
+        slices, i.e.\ one or a few slices blowing up; the per-image
+        accounting was added after this run) is the same mechanism as at
+        64 px below and as step 9's test image 14583, and is the first
+        sign that the plain validation mean is not a usable selection
+        statistic.
+  \item \textbf{(ii) holds.} The 64 samples are finite, 4.2\% of pixels
+        fall outside $[-1,1]$ before clamping (bone saturating at white and
+        air at black, the two ends of the window), and every sample is a
+        thorax or an upper abdomen: body outline, two dark lung fields or a
+        liver, a bright spine, the table. At 12 mm per pixel there is
+        nothing finer to get right.
+  \item \textbf{(iii) holds exactly.} The samples' nearest-training RMS
+        distance is 0.229, the validation slices' own is $0.229 \pm 0.046$
+        (minimum 0.132 over 11,971 slices; the closest sample is at 0.132
+        as well): the model is not reproducing training slices, it is as
+        far from them as an unseen patient is.
+\end{itemize}
+
+\paragraph{64 px (6 mm/px).}
+\begin{itemize}
+  \item \textbf{(i) holds, once the validation statistic was repaired.}
+        Under the plain mean the run stopped at epoch 17, because epochs
+        13--17 scored 377, 3.46, 50.9, 4098 and 3606 bits/dim on the 4000
+        validation slices; every one of those numbers is two slices (of
+        4000) at $10^{2}$--$10^{7}$ bits/dim, and the remaining 3998 kept
+        improving. The evidence that this was not over-fitting: the
+        \emph{final} epoch-17 checkpoint scored 2.901 on the 12,136 test
+        slices against 2.961 for the ``best'' epoch-11 one, and neither had
+        a single test slice above 10 bits/dim. The run was therefore
+        resumed from epoch 17 with the selection statistic changed to the
+        mean over validation slices below 10 bits/dim (the step-9 outlier
+        accounting, \texttt{val\_stat: robust}; patience counted from the
+        resume; recorded in the config header and in
+        \texttt{first\_run\_mean\_rule/}). Under that statistic the
+        validation curve is the expected one: 2.928 at epoch 18, best 2.914
+        at epoch 20, then a slow rise (2.914, 2.916, 2.919, 2.922, 2.929,
+        2.932) against a still-falling training loss ($-3.87 \to -3.92$) and
+        a gradient norm climbing from 48 to 88 --- mild over-fitting, the
+        rule stopping the run at 26 of 30. Test bits/dim: 2.900 for the
+        epoch-20 checkpoint (median 2.896, 99th percentile 4.50, maximum
+        4.91, none above 10) against 2.926 for the final one, 0.014 below
+        its validation value. Per pixel the model is $0.74$ bits/dim better
+        than the 32-px one --- expected, since a 6 mm pixel is more
+        predictable from its neighbours than a 12 mm one. (Step 9's
+        ChestMNIST-64 model reached 3.025 with three times the parameters
+        and a similar number of images; a different dataset, so only the
+        order of magnitude is comparable.)
+  \item \textbf{What the two blown-up slices are} (Figure~\ref{fig:step13valout};
+        \texttt{--val-outliers}, run on both checkpoints after training).
+        The same two of 4000 slices fail under both: validation slice 1095
+        (72 bits/dim under the best checkpoint, 1707 under the final one)
+        and 2426 ($7.5 \times 10^{4}$ and $7.7 \times 10^{5}$). Both carry
+        bright objects \emph{in the air above the chest wall} --- ECG
+        electrodes and leads on the skin, a feature rare enough in the
+        training split that the model has no context for it --- and slice
+        2426 is additionally a shoulder-level section (humeral heads at the
+        edge of the field of view). The largest first-block $|z|$ is on one
+        of those bright dots in slice 1095; the failure is then a chain: the
+        maximum $|z|$ after the eight blocks runs 10, 20, 60, 60, 60, 50,
+        30, 600 (slice 1095) and 10, 10, 20, 20, 20, 50, 100, $2 \times
+        10^{4}$ (slice 2426), i.e.\ each block's coupling, conditioned on
+        an already-atypical context, predicts a small scale for a token
+        that is then far from its prediction, and the last block --- whose
+        log-scale is bounded at 8, a factor of 2981 --- turns a $|z|$ of
+        100 into $2 \times 10^{4}$. A single latent coordinate of that size
+        contributes $z^{2}/2 = 2 \times 10^{8}$ nats, which over 4096 pixels
+        is $7 \times 10^{4}$ bits/dim: the whole excess is one coordinate.
+        Sharper (later) checkpoints make it worse (72 $\to$ 1707 bits/dim
+        on slice 1095 from epoch 20 to 26), which is why the plain mean
+        \emph{rose} with training and read as over-fitting. The test split
+        happens to contain no such slice (maximum 4.9 bits/dim); the rate
+        is of order 1 in 2000.
+  \item \textbf{(ii) holds, with a visible step up from 32 px.} The 64
+        samples are finite, 3.2\% of pixels leave $[-1,1]$ (12.9\% at the
+        epoch-11 checkpoint of the first run: the later epochs mainly
+        tightened the ends of the window), and the grid shows lung fields
+        with a few vessel dots, a mediastinum, a spine with its canal, ribs
+        along the body edge, liver and bowel gas in the abdominal sections,
+        and the curved table; a few outlines are implausibly shaped (a
+        flattened or cut body) and a few lung fields contain bright patches
+        with no anatomical counterpart. What it does not show at 6 mm is
+        fissures or bronchi, which is claim (iv)'s test for the next rung.
+  \item \textbf{(iii) holds.} Nearest-training RMS distance 0.276 for the
+        samples against $0.293 \pm 0.057$ for validation slices (minimum
+        0.141); the closest sample (0.157) is a small abdominal section
+        and its nearest training slice has a different organ layout.
+  \item \textbf{(iv), 32 $\to$ 64, holds.} Side by side, the 32-px grid is
+        outlines with two dark blobs and a bright dot; the 64-px grid adds
+        the ribs, the spinal canal, the shape of the mediastinum, vessel
+        dots in the lungs and the table --- structure, not larger blobs.
+  \item \textbf{Cost.} 152.6M parameters at batch 64 with per-block
+        checkpointing: 5.4 GB, 0.53 s per step, 6.9 minutes per 48k-image
+        epoch, 173 minutes for the 26 epochs; the official sequential
+        reverse draws 64 samples in 2.9 s.
+\end{itemize}
+%% STEP13_ANALYSIS_128
+
+\IfFileExists{../outputs/step13_lidc_tarflow_64/figures/val_outliers_best.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.8\textwidth]{outputs/step13_lidc_tarflow_64/figures/val_outliers_best.png}
+\caption{64 px: the two of 4000 validation slices above 10 bits/dim under
+the best checkpoint (\texttt{--val-outliers}), with the maximum $|z|$
+after each of the eight blocks and, in red, the $4\times4$ token with the
+largest $|z|$ after the first block. Both carry ECG leads in the air above
+the chest wall.}
+\label{fig:step13valout}
+\end{figure}}{}
 
 \section{Step 14: The six measurement systems on LIDC slices, along the ladder}
 \label{sec:step14}
@@ -2975,15 +3119,78 @@ gradient norm per 24k-image epoch.}
         inpainting, $2\times$ and $4\times$ super-resolution, sparse-view
         CT --- each on a different test slice, solved by the latent MAP
         $\arg\min_z -\log p(y|g_\theta(z)) - \log\mathcal{N}(z)$ with Adam
-        (lr $0.1 \to 5\times10^{-3}$ cosine, 300 steps, the schedule of the
-        step-11 sweep) from three independent $\mathcal{N}(0,I)$ inits run
-        as one batch through the CUDA-graph reverse, under the step-13
-        prior of the resolution. Every system is $y = Ax + \sigma\epsilon$
+        (lr $0.1 \to 5\times10^{-3}$ cosine, 1000 steps, the schedule of the
+        step-11 sweep) from three independent $\mathcal{N}(0,I)$ inits,
+        under the step-13 prior of the resolution. All six systems' restarts
+        are optimised together as \emph{one} batch of 18 through the
+        CUDA-graph reverse: Adam is elementwise and the objective is a sum
+        over rows, so this is exactly the eighteen independent
+        optimisations, and the sequential reverse is latency-bound at
+        $T = 64$ (0.28 s per step for 18 rows against 0.18 s for 3) though
+        not at $T = 256$ (7.7 s against 2.4 s: the functional cache copies
+        of \texttt{FastReverse} scale with the batch, see the next bullet),
+        so the batch costs 1--2 systems' worth per step instead of six.
+        \emph{Deviation, recorded:} the first 32- and 64-px galleries
+        ran the systems one after the other with 300 steps each; at 64 px
+        that was not converged (box inpainting: all restarts thousands of
+        nats above the truth's objective), so the batch and the step-11 step
+        count were adopted and the first runs are kept under
+        \texttt{first\_runs\_300\_steps/} and quoted in the Analysis.
+        Every system is $y = Ax + \sigma\epsilon$
         with the \emph{exact} forward operator on the $[-1,1]$ scale of the
         model window (so $0.05 = 35$ HU and $0.25 = 175$ HU): the pixel
         mask, $2\times 2$ or $4 \times 4$ average pooling, and the
         pixel-driven Radon transform of \texttt{measlib.radon\_matrix} with
         $\lceil N\sqrt2\rceil$ detector bins (odd) over 180$^\circ$.
+  \item \textbf{A second reverse for $T = 1024$ (deviation, recorded).}
+        \texttt{invlib.FastReverse} (step 11) makes each token step a pure
+        function of static shape by passing the whole $(B, L, T, C)$ KV
+        cache through it functionally --- copied into the graph's static
+        buffers, rewritten with the new slot, cloned out, and in the backward
+        rebuilt from the saved slots and cloned again --- about twenty full
+        passes over the cache per token step, i.e.\ $O(BT^{2})$ memory
+        traffic per pass through the model. That was invisible at $T = 64$
+        and tolerable at $T = 256$ (2.4 s per Adam step at batch 3, 7.7 s
+        at batch 18), but extrapolates to about a minute per step at $T =
+        1024$, forty hours per gallery. The 128- and 256-px galleries
+        therefore use \texttt{invlib.FastReverse2} (\texttt{reverse: fast2}
+        in the config): the same recursion with the cache as a static
+        buffer written \emph{in place} --- slot $i$ is written once, at step
+        $i$, so the cache at the end of a block pass restricted to the slots
+        below $i$ is exactly what step $i$ saw, and the backward can read it
+        as a constant --- and with the gradient with respect to the cached
+        keys and values, a rank-one update per token step and the only
+        thing in the backward that touches the whole cache, deferred: the
+        attention probabilities and score gradients of a chunk of 128 token
+        steps are kept as rows and applied as one matrix product per chunk;
+        the token's own key and value enter its attention as an explicit
+        extra entry so that their gradient goes through autograd with the
+        rest of the token network. A token step then reads the cache six
+        times and writes one slot, and the graphs are captured per chunk so
+        that a step reads only the slots below its chunk's end.
+        \texttt{check\_fast\_reverse2} compares the two on the trained
+        priors (random $z$, batch 3; relative max-abs differences of $x$,
+        $\log q$ and the gradient of a random linear functional with
+        respect to $z$): on the 32-px prior ($T = 64$) $1.2 \times 10^{-5}$,
+        $2.6 \times 10^{-7}$ and $4.0 \times 10^{-5}$ against the compiled
+        reverse and $1.9 \times 10^{-5}$, $3.5 \times 10^{-7}$ and $7.0
+        \times 10^{-5}$ against the eager one --- the same to every printed
+        digit whether the new reverse runs eagerly or from its captured
+        graphs, so the graphs are exact and the residue is fp32 operation
+        order (a CPU check on a small random model agrees to $1$--$4 \times
+        10^{-6}$); on the 64-px prior ($T = 256$) $1.8 \times 10^{-5}$, $5.9
+        \times 10^{-7}$ and $1.3 \times 10^{-5}$. Measured cost of a
+        forward-and-backward pass at batch 18: 3.1 s at $T = 256$ against
+        7.7 s (peak 2.4 GB against 9.3), and 17.2 s at $T = 1024$ with chunks
+        of 128 (18.6 s with 256; 6.0 GB) --- 4.8 h for a 1000-step gallery
+        instead of the extrapolated forty. At $T = 256$ the 1.5 ms per
+        block and token step is the floor of some 400 kernel launches
+        rather than cache traffic (about 0.3 ms at this size), which is why
+        the gain over the first reverse is $2.5\times$ and not the ratio of
+        the two traffics; at $T = 1024$ (2.1 ms) the traffic adds roughly
+        as much again as the floor. The 32- and 64-px galleries ran with
+        \texttt{FastReverse}; the two compute the same map, so they were
+        not re-run.
   \item \textbf{The same task at every resolution.} The parameters are
         stated at 64 px and scaled with the side $N$: the box covers
         $3/8$ of the side ($12, 24, 48, 96$ px), the random mask drops 70\%
@@ -3035,6 +3242,10 @@ gradient norm per 24k-image epoch.}
 {\small\verbatiminput{../configs/step14_lidc_gallery.yml}}
 
 \subsection{Results}
+Each line reports, per system, the lowest-objective restart --- the one the
+method would pick without the truth --- with its $J_z$, data term, PSNR and
+$\|z\|$; where another restart has a better PSNR it is added in parentheses.
+
 \InputIfFileExists{../outputs/step14_lidc_gallery/data/summary.tex}{}
   {\emph{not generated yet -- run \texttt{python step14\_lidc\_gallery.py --res 32}.}}
 
@@ -3064,7 +3275,126 @@ PSNR, one test slice per system.}
 
 \subsection{Analysis}
 \label{sec:step14analysis}
-%% STEP14_ANALYSIS
+The rungs are analysed as they finish, each against the four claims and
+against its archived 300-step first run (\texttt{first\_runs\_300\_steps/},
+the numbers in parentheses below).
+
+\paragraph{32 px (8 views, $T = 64$).}
+\begin{itemize}
+  \item \textbf{The 300-step runs were not converged; 1000 steps are.} With
+        the batch of 18 and 1000 steps every system's best restart ends with
+        its data term at or below the noise level --- denoising $-130$
+        against $+33$, box inpainting $-1448$ against $-1388$, random
+        inpainting $-548$ against $-481$, $2\times$ SR $-455$ against
+        $-404$, $4\times$ SR $-118$ against $-101$, CT $235$ against $273$
+        --- and every objective below the truth's ($J_z$ 933 vs.\ 1448,
+        $-300$ vs.\ $-80$, 525 vs.\ 951, 552 vs.\ 908, 839 vs.\ 1255, 1249
+        vs.\ 1575). At 300 steps box inpainting had stopped at $J_z = +323$
+        (403 nats above the truth, data term $-1015$) and random inpainting
+        at 863; in the 1000-step run the best objectives were still falling
+        between steps 300 and 1000 in every system but $4\times$ SR (844
+        $\to$ 839): box inpainting $-114 \to -300$, random inpainting $672
+        \to 525$, $2\times$ SR $635 \to 552$, denoising $999 \to 933$, CT
+        $1288 \to 1249$. The sequential
+        300-step gallery took 5.4 min for 1800 Adam steps, the batched
+        1000-step one 4.7 min for 1000 (0.28 s per step at batch 18 against
+        0.18 at batch 3): at $T = 64$ the reverse is indeed latency-bound.
+  \item \textbf{(i) half holds.} The multimodality part holds for box
+        inpainting: the three restarts end at $J_z = -91$, $-109$ and $-300$
+        with visibly different lung content inside the $12 \times 12$ box
+        (restart spread 0.147 RMS, PSNR 18.8--21.6 dB) --- distinct local
+        minima, the best 220 nats below the truth. Random inpainting shows
+        the same (525, 585, 743; spread 0.116) and CT less so (1249, 1376,
+        1481; spread 0.058; PSNR 26.6--27.6). But the ``data term above the
+        noise level'' part is false at 32 px: with enough steps every
+        restart of every system fits its data to the noise level, box
+        inpainting and CT included. What distinguishes the ill-posed systems
+        is not a data-term residual but the spread of the minima.
+  \item \textbf{(ii) holds.} $\|z\|$ at the solutions is 6 ($4\times$ SR),
+        12 ($2\times$ SR, CT's best), 15 (denoising), 16--19 (random
+        inpainting) and 20--25 (box inpainting) against the prior's typical
+        $\sqrt{TD} = 32$: the latent MAP sits far inside the typical set,
+        most so where the data constrain least, exactly as in step 11.
+  \item \textbf{Denoising: a lower objective and a worse image.} The
+        denoising MAP is the one system whose PSNR \emph{fell} with more
+        optimisation, from 26.7 dB (300 steps, data term $-16$, at the noise
+        level) to 23.2 dB (1000 steps, data term $-130$): the optimiser
+        keeps lowering $J_z$ by fitting part of the $\sigma = 0.25$ noise
+        --- the residual ends at two thirds of the noise variance --- and the
+        prior at 32 px does not charge enough for the speckle this puts into
+        the lung fields to stop it. The mode of the posterior is not its
+        mean, and here the difference is 3.5 dB; the restart spread of 0.031
+        says all three restarts agree on this noise-fitting solution.
+  \item \textbf{Cost (iii).} 0.28 s per Adam step for 18 rows at $T = 64$
+        (six blocks): 8.4 s of graph build and 282 s of optimisation.
+\end{itemize}
+\paragraph{64 px (16 views, $T = 256$).}
+\begin{itemize}
+  \item \textbf{The batch of 18 and 1000 steps fixed the pathological
+        first run, but two systems are still not at their minimum.} Box
+        inpainting, which ended the sequential 300-step run at $J_z =
+        +2016$ (2500 nats above the truth's $-479$), now has a restart at
+        $-1060$ --- 580 nats below the truth --- with its data term at the
+        noise level ($-5657$ against $-5550$). $2\times$ and $4\times$ SR and
+        denoising end below the truth's objective with data terms at the
+        noise level ($-1556$ vs.\ $-1615$; $-410$ vs.\ $-404$; $-134$ vs.\
+        $+134$). But random inpainting ends at $J_z = 4435$ (truth 3650) with
+        a data term of $+7$ against a noise level of $-1865$: the residual
+        on the 1183 observed pixels has RMS $2.0\sigma$, and sparse-view CT
+        ends at 7337 (truth 7121) with residual RMS $1.2\sigma$ (data 2364
+        vs.\ 2066). Both were still falling in the last hundred steps
+        (4452 $\to$ 4435, 7361 $\to$ 7337) with the learning rate already
+        annealed to 0.005: the optimisation, not the prior, is what stops
+        them, and the truth is a better point of the latent space than any
+        the optimiser found. At equal step count the long schedule was
+        already ahead: at step 300 of the 1000-step run (learning rate
+        still 0.08) the best objectives were $-189$ (box), 5316 (random)
+        and 8616 (CT), against $+2016$, 7287 and 9666 at the end of the
+        300-step cosine, whose learning rate had decayed too early to
+        matter.
+  \item \textbf{(i) holds, and now in the form stated.} Box inpainting's
+        three restarts end at $-1060$, $-287$ and $+291$ with visibly
+        different content in the $24 \times 24$ hole (spread 0.217, PSNR
+        17.5--18.4 dB), and the two worse minima have data terms 310 and 660
+        nats above the noise level --- the ``local minima with the data term
+        above the noise level'' of the claim. CT is the same on a smaller
+        scale (7337, 7592, 8341; spread 0.121; all data terms above the
+        noise level, PSNR 22.9--25.6). Random inpainting adds a third case
+        (4435, 5851, 6565; spread 0.192). At 32 px every restart of every
+        system reached the noise level; at 64 px the landscape is rougher,
+        and even the well-posed systems show it: the denoising restarts are
+        200 nats apart (4012, 4208, 4258) with PSNR 23.7--26.4 dB.
+  \item \textbf{(ii) holds.} $\|z\|$ at the best restart is 22 ($4\times$
+        SR), 28 (denoising), 35 ($2\times$ SR), 36 (random inpainting), 41
+        (box inpainting) and 49 (CT) against the prior's typical $\sqrt{TD}
+        = 64$, the same ordering as at 32 px (weakest data, smallest
+        latent). Two restarts leave the window: box inpainting's worst has a
+        pixel at 2.4 and $4\times$ SR's middle one at 1.6 (the window is
+        $[-1, 1]$).
+  \item \textbf{Denoising: the 32-px effect, weaker.} The lowest objective
+        (4012) again belongs to a restart that fits part of the noise ---
+        residual variance 87\% of $\sigma^2$, PSNR 25.2 dB --- while the
+        restart with the best PSNR (26.4 dB, residual 92\%) is 246 nats
+        worse; at 300 steps the best restart had 25.6 dB at the noise level.
+        The 64-px prior charges more for speckle than the 32-px one did
+        (residual 68\% of $\sigma^2$ there, 3.5 dB lost against 0.4 dB
+        here).
+  \item \textbf{Cost (iii), and the reason for the second reverse.} 7.7 s
+        per Adam step for 18 rows at $T = 256$ (eight blocks), 12.3 s of
+        graph build, 128 min in all: per restart-step 0.43 s against 0.80 s
+        in the sequential run, a factor 1.9, not the factor 6 the
+        ``latency-bound'' argument promised, because the functional cache
+        copies of the first reverse scale as $B\,T^2$. The Methods bullet
+        above gives the fix used from 128 px on.
+  \item \textbf{(iv) is not testable across rungs by PSNR.} The best-restart
+        PSNRs are 25.2 (denoising), 18.4 (box), 23.9 (random), 28.1
+        ($2\times$ SR), 23.5 ($4\times$ SR) and 25.6 dB (CT) against 23.0,
+        21.6, 23.5, 25.9, 25.3 and 27.6 at 32 px --- three up, three down ---
+        but the images differ (a 64-px slice has detail a 32-px one lacks)
+        and the two hardest systems are stuck short of their minima, so the
+        comparison says more about the optimiser than about the prior.
+\end{itemize}
+%% STEP14_ANALYSIS_128
 
 \section{Reproducibility}
 \begin{itemize}

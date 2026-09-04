@@ -33,6 +33,9 @@ train:
   eval_every: 1
   val_subset: 2000
   early_stop_patience: 6
+  # select/stop on the mean over the validation slices below 10 bpd, not the plain mean
+  # (one blown-up slice moves the mean of 2000 by more than an epoch of progress)
+  val_stat: robust
   sample_every: 3
   sample_nrow: 8
   sample_rows: 4

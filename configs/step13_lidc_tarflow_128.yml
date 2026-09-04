@@ -3,8 +3,11 @@
 # patch 4, AFHQ 256: patch 8); here patch 4 -> T = 1024 tokens of dimension 16, so each
 # token is the same 4 x 4 patch of grey levels as in the 64-px model and only the
 # sequence is four times longer. Same 512-channel, 8-block, 6-layer transformer
-# (156M parameters); batch 16 with per-block activation checkpointing (5.6 GB,
-# 0.83 s/step = 52 ms per image, TF32); 24k images per "epoch" (~17 min).
+# (156M parameters); batch 16 with per-block activation checkpointing (5.5 GB,
+# 0.83 s/step = 52 ms per image, TF32; batch 32 gives the same 52 ms per image at
+# 8.7 GB, so the smaller batch is kept for twice the updates, with the learning rate
+# scaled from the 64-px run's 2e-4 at batch 64 by the square root of the batch ratio);
+# 24k images per "epoch" (~21 min plus validation and sampling).
 
 seed: 20260904
 tarflow_repo: /dev_ws/ml-tarflow
@@ -34,6 +37,9 @@ train:
   eval_every: 1
   val_subset: 2000
   early_stop_patience: 6
+  # select/stop on the mean over the validation slices below 10 bpd, not the plain mean
+  # (one blown-up slice moves the mean of 2000 by more than an epoch of progress)
+  val_stat: robust
   sample_every: 3
   sample_nrow: 8
   sample_rows: 4

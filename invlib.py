@@ -870,6 +870,354 @@ class FastReverse:
         return self.model.unpatchify(x), log_q
 
 
+# --------------------------------------------------------------------------
+# FastReverse2: the same sampling direction with an in-place KV cache
+# --------------------------------------------------------------------------
+#
+# FastReverse passes the whole (B, L, T, C) cache through every token step
+# functionally -- copied into the static buffers, rewritten with the new slot,
+# cloned out, and in the backward rebuilt from the saved slots and cloned
+# again -- about twenty full passes over the cache per token step, so one
+# pass through the model costs O(B T^2) memory traffic: measured 2.4 s at
+# (B, T) = (3, 256), 7.7 s at (18, 256), and of the order of a minute at
+# (18, 1024). Here the cache is a static buffer written in place -- slot i is
+# written once, at step i, and never changed, so the cache at the end of a
+# block pass restricted to the slots below i IS the cache the step saw -- and
+# the backward treats it as a constant: the gradient with respect to the
+# cached keys and values (a rank-one update per token step, the only thing
+# that touches the whole cache in the backward) is deferred, the attention
+# probabilities and score gradients of a chunk of steps are kept as rows and
+# applied as one matrix product per chunk. The current token's own key and
+# value enter the attention as an explicit (n+1)-th entry, so their gradient
+# goes through autograd like the rest of the token network. A token step then
+# reads the cache six times (twice in the forward, four times in the
+# recompute-and-backward) and writes one slot, and the graphs are captured
+# per chunk so that a step only reads the slots below its chunk's end.
+# Results agree with FastReverse to floating-point order (see
+# `check_fast_reverse2`).
+
+
+def _decode_attn(q, k, v, Kc, Vc, bias, scale):
+    """Attention of one query against a cache and itself. q, k, v (B, H, 1, D):
+    the current token's query, key, value; Kc, Vc (B, H, n, D): cache slots
+    0..n-1 of which those >= i are masked by bias (1, 1, 1, n). Returns the
+    output (B, H, 1, D) and the probabilities (B, H, 1, n + 1), the last entry
+    being the token's own."""
+    s = torch.matmul(q, Kc.transpose(-1, -2)) * scale + bias
+    s_self = (q * k).sum(-1, keepdim=True) * scale
+    p = torch.cat([s, s_self], -1).softmax(-1)
+    o = torch.matmul(p[..., :-1], Vc) + p[..., -1:] * v
+    return o, p
+
+
+class _DecodeAttn(torch.autograd.Function):
+    """`_decode_attn` with the cache as a constant; its backward hands the
+    rows needed for the cache gradient to a `_ChunkRecorder`."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, Kc, Vc, bias, scale, rec, l):
+        o, p = _decode_attn(q, k, v, Kc, Vc, bias, scale)
+        ctx.save_for_backward(q, k, v, Kc, Vc, p)
+        ctx.scale, ctx.rec, ctx.l = scale, rec, l
+        return o
+
+    @staticmethod
+    def backward(ctx, g_o):
+        q, k, v, Kc, Vc, p = ctx.saved_tensors
+        scale = ctx.scale
+        g_p = torch.cat([torch.matmul(g_o, Vc.transpose(-1, -2)), (g_o * v).sum(-1, keepdim=True)], -1)
+        g_s = p * (g_p - (p * g_p).sum(-1, keepdim=True))
+        g_q = (torch.matmul(g_s[..., :-1], Kc) + g_s[..., -1:] * k) * scale
+        g_k = g_s[..., -1:] * q * scale
+        g_v = p[..., -1:] * g_o
+        if ctx.rec is not None:
+            ctx.rec.record(ctx.l, p[..., :-1], g_s[..., :-1] * scale, q, g_o)
+        return g_q, g_k, g_v, None, None, None, None, None, None
+
+
+class _ChunkRecorder:
+    """Rows of one chunk of token steps, per layer: attention probabilities P
+    and scaled score gradients GS over the cache slots (L, B, H, chunk, T), and
+    the query Q and output gradient GO (L, B, H, chunk, D). The gradient of
+    the cache is  gK[:, :, :n] += GS^T Q,  gV[:, :, :n] += P^T GO  once per
+    chunk, and the part of slot i's gradient owed by the steps of its own
+    chunk above it is the column i of these rows."""
+
+    def __init__(self, L, B, H, chunk, T, D, device):
+        z = lambda *s: torch.zeros(*s, device=device)
+        self.P, self.GS = z(L, B, H, chunk, T), z(L, B, H, chunk, T)
+        self.Q, self.GO = z(L, B, H, chunk, D), z(L, B, H, chunk, D)
+        self.iloc = torch.zeros(1, dtype=torch.long, device=device)       # row of the current step
+
+    def record(self, l, p, gs, q, g_o):
+        n = p.shape[-1]
+        self.P[l, :, :, :, :n].index_copy_(2, self.iloc, p)
+        self.GS[l, :, :, :, :n].index_copy_(2, self.iloc, gs)
+        self.Q[l].index_copy_(2, self.iloc, q)
+        self.GO[l].index_copy_(2, self.iloc, g_o)
+
+    def slot_grad(self, i):
+        """(gK-part, gV-part) of slot i from this chunk's rows, (L, B, H, 1, D)."""
+        gs_col = self.GS.index_select(4, i).transpose(-1, -2)                # (L, B, H, 1, chunk)
+        p_col = self.P.index_select(4, i).transpose(-1, -2)
+        return torch.matmul(gs_col, self.Q), torch.matmul(p_col, self.GO)
+
+
+class _Shared2:
+    """Buffers shared by all blocks of a FastReverse2 (blocks run one after
+    the other): the token step's inputs and outputs, the cache gradient of
+    the block being back-propagated and the chunk recorder."""
+
+    def __init__(self, L, B, H, chunk, T, D, C, Cin, device):
+        z = lambda *s: torch.zeros(*s, device=device)
+        self.s_tok, self.s_za, self.s_zb, self.s_gza, self.s_gzb, self.s_gtok = (z(B, Cin) for _ in range(6))
+        self.s_i = torch.zeros(1, dtype=torch.long, device=device)
+        self.gK, self.gV = z(L, B, H, T, D), z(L, B, H, T, D)
+        self.rec = _ChunkRecorder(L, B, H, chunk, T, D, device)
+        self.pool = torch.cuda.graph_pool_handle() if device.type == "cuda" else None
+
+
+def _token_step2(tok, i, n, gb, rec, write):
+    """One token of a MetaBlock's sampling direction against gb's in-place
+    cache, reading slots < n. tok (B, Cin): recovered token i; i (1,) long.
+    `write` writes the token's key and value into slot i (forward pass);
+    `rec` records the deferred cache gradients (backward pass). Returns za,
+    zb (B, Cin) and the per-layer keys and values (B, H, 1, D). Same
+    arithmetic as `_token_step`."""
+    B, H, D, C, L = gb.B, gb.H, gb.D, gb.C, gb.L
+    w_in, b_in, w_out, b_out = gb.params[:4]
+    x = F.linear(tok, w_in, b_in) + gb.pos_table.index_select(0, i)
+    bias = gb.bias_table.index_select(0, i)[:, :n][:, None, None, :]
+    ks, vs = [], []
+    for l in range(L):
+        (ln1w, ln1b, wqkv, bqkv, wp, bp, ln2w, ln2b, w1, b1, w2, b2) = \
+            gb.params[4 + N_LAYER_PARAMS * l: 4 + N_LAYER_PARAMS * (l + 1)]
+        h = F.layer_norm(x, (C,), ln1w, ln1b, 1e-5)
+        q, k, v = F.linear(h, wqkv, bqkv).split(C, dim=-1)
+        qh, kh, vh = q.view(B, H, 1, D), k.view(B, H, 1, D), v.view(B, H, 1, D)
+        o = _DecodeAttn.apply(qh, kh, vh, gb.K[l, :, :, :n], gb.V[l, :, :, :n], bias, gb.scale, rec, l)
+        x = x + F.linear(o.reshape(B, C), wp, bp)
+        h = F.layer_norm(x, (C,), ln2w, ln2b, 1e-5)
+        x = x + F.linear(F.gelu(F.linear(h, w1, b1)), w2, b2)
+        if write:
+            gb.K[l].index_copy_(2, i, kh)
+            gb.V[l].index_copy_(2, i, vh)
+        ks.append(kh)
+        vs.append(vh)
+    za, zb = F.linear(x, w_out, b_out).chunk(2, dim=-1)
+    if gb.bound is not None:
+        za = gb.bound * torch.tanh(za / gb.bound)
+    return za, zb, ks, vs
+
+
+class _GraphedBlock2:
+    """One MetaBlock's in-place cache (L, B, H, T, D) and, per chunk of token
+    steps, its two CUDA graphs (forward step; recompute + backward step)."""
+
+    def __init__(self, blk, batch, device, shared, chunk, graph=True):
+        self.blk, self.shared = blk, shared
+        T, C = blk.pos_embed.shape
+        L, Cin = len(blk.attn_blocks), blk.proj_in.in_features
+        a0 = blk.attn_blocks[0].attention
+        self.H, self.scale = a0.num_heads, a0.sqrt_scale ** 2
+        self.D = C // self.H
+        self.bound = float(blk.log_scale_bound) if hasattr(blk, "log_scale_bound") else None
+        self.B, self.T, self.L, self.C, self.Cin = batch, T, L, C, Cin
+        self.params = _block_params(blk)
+        with torch.no_grad():
+            self.pos_table = blk.permutation(blk.pos_embed.detach(), dim=0).contiguous()
+        self.bias_table = torch.triu(torch.full((T, T), -1e30, device=device), 0)   # row i: masked from slot i on
+        self.K = torch.zeros(L, batch, self.H, T, self.D, device=device)
+        self.V = torch.zeros_like(self.K)
+        self.chunks = [(c0, min(c0 + chunk, T)) for c0 in range(0, T - 1, chunk)]   # token steps are 0..T-2
+        self.pass_id = 0
+        self.graphs = None
+        if graph:
+            self.graphs = []
+            s = torch.cuda.Stream(device)
+            s.wait_stream(torch.cuda.current_stream(device))
+            for c0, c1 in self.chunks:
+                with torch.cuda.stream(s):                                  # warm-up
+                    self._fwd(c1)
+                    self._bwd(c1)
+                torch.cuda.current_stream(device).wait_stream(s)
+                torch.cuda.synchronize(device)
+                g_fwd, g_bwd = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g_fwd, pool=shared.pool):
+                    self._fwd(c1)
+                with torch.cuda.graph(g_bwd, pool=shared.pool):
+                    self._bwd(c1)
+                self.graphs.append((g_fwd, g_bwd))
+            torch.cuda.synchronize(device)
+
+    def _fwd(self, n):
+        sh = self.shared
+        with torch.no_grad():
+            za, zb, _, _ = _token_step2(sh.s_tok, sh.s_i, n, self, None, True)
+            sh.s_za.copy_(za)
+            sh.s_zb.copy_(zb)
+
+    def _bwd(self, n):
+        sh, rec = self.shared, self.shared.rec
+        gk, gv = rec.slot_grad(sh.s_i)                                        # this chunk's steps above i
+        gk = gk + sh.gK.index_select(3, sh.s_i)                               # plus the flushed chunks above
+        gv = gv + sh.gV.index_select(3, sh.s_i)
+        tok = sh.s_tok.detach().requires_grad_(True)
+        with torch.enable_grad():
+            za, zb, ks, vs = _token_step2(tok, sh.s_i, n, self, rec, False)
+            (g_tok,) = torch.autograd.grad((za, zb, *ks, *vs), (tok,),
+                                           grad_outputs=(sh.s_gza, sh.s_gzb, *gk.unbind(0), *gv.unbind(0)))
+        sh.s_gtok.copy_(g_tok)
+
+    def fwd_step(self, c, n):
+        if self.graphs is None:
+            self._fwd(n)
+        else:
+            self.graphs[c][0].replay()
+
+    def bwd_step(self, c, n):
+        if self.graphs is None:
+            self._bwd(n)
+        else:
+            self.graphs[c][1].replay()
+
+    def flush(self, n):
+        """Apply the recorder's rows to the cache gradient of slots < n."""
+        sh, rec = self.shared, self.shared.rec
+        B, H, D = self.B, self.H, self.D
+        for l in range(self.L):
+            GS = rec.GS[l, :, :, :, :n].reshape(B * H, -1, n)
+            P = rec.P[l, :, :, :, :n].reshape(B * H, -1, n)
+            sh.gK[l, :, :, :n].view(B * H, n, D).baddbmm_(GS.transpose(1, 2), rec.Q[l].view(B * H, -1, D))
+            sh.gV[l, :, :, :n].view(B * H, n, D).baddbmm_(P.transpose(1, 2), rec.GO[l].view(B * H, -1, D))
+
+
+class _BlockReverse2(torch.autograd.Function):
+    """Sampling direction of one MetaBlock on the permuted tokens x (B, T,
+    Cin) -> (recovered tokens, per-example sum of za), with the block's cache
+    filled in the forward and consumed by the backward."""
+
+    @staticmethod
+    def forward(ctx, x, gb):
+        sh = gb.shared
+        B, T, _ = x.shape
+        gb.K.zero_()
+        gb.V.zero_()
+        toks, zas, zbs = [x[:, 0]], [], []
+        for c, (c0, c1) in enumerate(gb.chunks):
+            for i in range(c0, min(c1, T - 1)):
+                sh.s_tok.copy_(toks[i])
+                sh.s_i.fill_(i)
+                gb.fwd_step(c, c1)
+                za, zb = sh.s_za.clone(), sh.s_zb.clone()
+                toks.append(x[:, i + 1] * za.exp() + zb)
+                zas.append(za)
+                zbs.append(zb)
+        toks, za, zb = torch.stack(toks, 1), torch.stack(zas, 1), torch.stack(zbs, 1)
+        ctx.save_for_backward(x, toks, za, zb)
+        ctx.gb, ctx.pass_id = gb, gb.pass_id
+        return toks, za.sum((1, 2))
+
+    @staticmethod
+    def backward(ctx, g_toks, g_sumza):
+        gb = ctx.gb
+        if gb.pass_id != ctx.pass_id:
+            raise RuntimeError("FastReverse2: the block's cache was overwritten by a later forward pass; "
+                               "call backward before the next forward")
+        sh, rec = gb.shared, gb.shared.rec
+        x, toks, za, zb = ctx.saved_tensors
+        B, T, _ = x.shape
+        if g_sumza is None:                          # the objective did not use log_q
+            g_sumza = torch.zeros(B, device=x.device)
+        ea = za.exp()
+        g_x = torch.zeros_like(x)
+        g_tok = g_toks.clone()                       # d/d tok_i, accumulated as the steps above i are processed
+        sh.gK.zero_()
+        sh.gV.zero_()
+        for c in reversed(range(len(gb.chunks))):
+            c0, c1 = gb.chunks[c]
+            rec.P[..., :c1].zero_()
+            rec.GS[..., :c1].zero_()
+            for i in reversed(range(c0, min(c1, T - 1))):
+                g_next = g_tok[:, i + 1]                                     # tok_{i+1} = x_{i+1} e^{za_i} + zb_i
+                g_x[:, i + 1] = g_next * ea[:, i]
+                sh.s_gza.copy_(g_next * x[:, i + 1] * ea[:, i] + g_sumza[:, None])
+                sh.s_gzb.copy_(g_next)
+                sh.s_tok.copy_(toks[:, i])
+                sh.s_i.fill_(i)
+                rec.iloc.fill_(i - c0)
+                gb.bwd_step(c, c1)
+                g_tok[:, i] += sh.s_gtok
+            gb.flush(c1)
+        g_x[:, 0] = g_tok[:, 0]
+        return g_x, None
+
+
+class FastReverse2:
+    """x = g(z) for a TarFlow `model`, differentiable w.r.t. z, with the
+    in-place cache above; the interface of FastReverse. `chunk` is the number
+    of token steps per captured graph (and per deferred cache-gradient
+    update); `mode` is 'graph' (CUDA graphs) or 'eager' (no graphs; also the
+    CPU reference). A pass must be back-propagated before the next forward
+    pass (the caches are reused)."""
+
+    def __init__(self, model, batch, device, chunk=128, mode="graph"):
+        if not bool(torch.all(model.var == 1)):
+            raise NotImplementedError("FastReverse2 assumes the nvp unit base variance")
+        self.model, self.batch, self.mode, self.chunk = model, batch, mode, chunk
+        self.device = torch.device(device)
+        blk = model.blocks[0]
+        T, C = blk.pos_embed.shape
+        L, Cin, H = len(blk.attn_blocks), blk.proj_in.in_features, blk.attn_blocks[0].attention.num_heads
+        self.shared = _Shared2(L, batch, H, min(chunk, T), T, C // H, C, Cin, self.device)
+        self.blocks = [_GraphedBlock2(b, batch, self.device, self.shared, chunk, graph=(mode == "graph"))
+                       for b in model.blocks]
+        self.pass_id = 0
+
+    def __call__(self, z):
+        if z.size(0) != self.batch:
+            raise ValueError(f"FastReverse2 was built for batch {self.batch}, got {z.size(0)}")
+        self.pass_id += 1
+        log_q = -0.5 * (z ** 2 + math.log(2 * math.pi)).flatten(1).sum(-1)
+        x = z
+        for j in reversed(range(len(self.model.blocks))):
+            gb = self.blocks[j]
+            gb.pass_id = self.pass_id
+            toks, sum_za = _BlockReverse2.apply(gb.blk.permutation(x), gb)
+            x = gb.blk.permutation(toks, inverse=True)
+            log_q = log_q - sum_za
+        return self.model.unpatchify(x), log_q
+
+
+def check_fast_reverse2(model, batch, device, chunk, mode="graph", ref_mode="eager", seed=0):
+    """Compare FastReverse2 with FastReverse on random z: max |dx|, |dlog_q|
+    and |dgrad| (of a random linear functional of x and log_q w.r.t. z),
+    relative to the reference's scale."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    blk = model.blocks[0]
+    T, Cin = blk.pos_embed.shape[0], blk.proj_in.in_features
+    z = torch.randn(batch, T, Cin, generator=g).to(device)                 # tokens, as FastReverse takes them
+    w = None
+    out = {}
+    # built one at a time: the eager reference keeps every token step's graph (O(T^2) memory),
+    # so at T = 256 use ref_mode="compile" (the mode the galleries ran with)
+    for name, build in (("ref", lambda: FastReverse(model, batch, device, mode=ref_mode)),
+                        ("new", lambda: FastReverse2(model, batch, device, chunk=chunk, mode=mode))):
+        fr = build()
+        zz = z.clone().requires_grad_(True)
+        x, log_q = fr(zz)
+        if w is None:
+            w = torch.randn(x.shape, generator=g).to(device)
+        ((x * w).sum() + log_q.sum()).backward()
+        out[name] = (x.detach(), log_q.detach(), zz.grad.detach())
+        del fr, x, log_q, zz
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
+    rel = lambda a, b: float((a - b).abs().max() / b.abs().max())
+    return dict(dx=rel(out["new"][0], out["ref"][0]), dlogq=rel(out["new"][1], out["ref"][1]),
+                dgrad=rel(out["new"][2], out["ref"][2]))
+
+
 # ==========================================================================
 # Family 2: InvertibleModule -- general invertible maps with logdet
 # ==========================================================================

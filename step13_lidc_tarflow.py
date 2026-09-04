@@ -171,23 +171,51 @@ def train(cfg, device, out_data, out_figs):
     real = torch.stack([train_loader.dataset[i][0] for i in range(n_show)])
     tv.utils.save_image((real + 1) / 2, out_figs / "real_grid.png", nrow=tr["sample_nrow"])
 
+    # The validation statistic that selects the checkpoint and drives the early
+    # stop: "mean" is the official bits/dim; "robust" is the mean over the
+    # validation images below 10 bpd (the outlier accounting of step 9), because
+    # a single validation slice on which the autoregressive flow blows up moves
+    # the mean of 4000 by more than an epoch of progress and the plain rule then
+    # stops a run that is still improving (the 64-px run, epochs 12-17).
+    val_stat = tr.get("val_stat", "mean")
+    columns = ["epoch", "loss", "mse_z", "logdet", "lr", "grad_norm", "val_bpd", "val_bpd_robust", "val_n_fail",
+               "epoch_seconds", "sample_seconds", "n_nonfinite"]
     metrics_path, ckpt_path = out_data / "metrics.csv", out_data / "ckpt.pth"
-    start_epoch, step, val_bpds, best = 0, 0, [], (float("inf"), 0)
+    start_epoch, step, val_bpds, best, patience_ref = 0, 0, [], (float("inf"), 0), 0
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch, step, val_bpds = ckpt["epoch"], ckpt["step"], ckpt["val_bpds"]
         best = tuple(ckpt["best"])
-        print(f"{tag} resumed at epoch {start_epoch} (best val bpd {best[0]:.4f} @ {best[1]})", flush=True)
+        if ckpt.get("val_stat", "mean") != val_stat:
+            # the selection statistic changed at this resume: the stored best score is kept as
+            # the value to beat, but the patience is counted from here, not from its epoch
+            patience_ref = start_epoch
+        print(f"{tag} resumed at epoch {start_epoch} (best val bpd {best[0]:.4f} @ {best[1]}, "
+              f"selection statistic '{val_stat}'" + (f", changed from '{ckpt.get('val_stat', 'mean')}': patience "
+              f"counted from epoch {start_epoch}" if patience_ref else "") + ")", flush=True)
+        with open(metrics_path, newline="") as f:
+            rows = list(csv.reader(f))
+        if rows and rows[0] != columns:      # metrics written before the robust columns existed: pad them
+            old = rows[0]
+            rows = [columns] + [[r[old.index(c)] if c in old else "" for c in columns] for r in rows[1:]]
+            with open(metrics_path, "w", newline="") as f:
+                csv.writer(f).writerows(rows)
     else:
         with open(metrics_path, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "loss", "mse_z", "logdet", "lr", "grad_norm", "val_bpd", "epoch_seconds",
-                                    "sample_seconds", "n_nonfinite"])
+            csv.writer(f).writerow(columns)
 
     def early_stop(epochs_done):
         patience = tr.get("early_stop_patience")
-        return bool(patience) and bool(val_bpds) and epochs_done - best[1] >= patience
+        return bool(patience) and bool(val_bpds) and epochs_done - max(best[1], patience_ref) >= patience
+
+    def validate():
+        """(official mean, robust mean, number of images above 10 bpd) on the validation subset."""
+        set_tf32(False)
+        st = bpd_stats(per_image_bpd(model, val_loader, device, seed=cfg["seed"])[0])
+        set_tf32(cfg.get("tf32", False))
+        return st["mean"], st["mean_excl_outliers"], st["n_over_thresh"]
 
     def sample_grid(name):
         set_tf32(False)
@@ -238,14 +266,13 @@ def train(cfg, device, out_data, out_figs):
                       f"gn {sums['gn']/nb:.2f} lr {lr_at(step):.2e} {(time.time()-t0)/nb:.3f} s/step{peak}", flush=True)
         train_seconds = time.time() - t0
 
-        val_bpd = ""
+        val_bpd = val_robust = val_fail = ""
         if (epoch + 1) % tr["eval_every"] == 0 or epoch + 1 == tr["epochs"]:
-            set_tf32(False)
-            val_bpd = s9.evaluate_bpd(model, val_loader, device, seed=cfg["seed"])
-            set_tf32(cfg.get("tf32", False))
-            val_bpds.append((epoch + 1, val_bpd))
-            if val_bpd < best[0]:
-                best = (val_bpd, epoch + 1)
+            val_bpd, val_robust, val_fail = validate()
+            val_bpds.append((epoch + 1, val_bpd, val_robust, val_fail))
+            score = val_robust if val_stat == "robust" else val_bpd
+            if score < best[0]:
+                best = (score, epoch + 1)
                 torch.save(model.state_dict(), out_data / "model_best.pth")
         stopped_early = early_stop(epoch + 1)
         n_bad, sample_seconds = 0, 0.0
@@ -254,12 +281,13 @@ def train(cfg, device, out_data, out_figs):
         dt = time.time() - t0
         with open(metrics_path, "a", newline="") as f:
             csv.writer(f).writerow([epoch + 1, sums["loss"] / max(nb, 1), sums["mse"] / max(nb, 1), sums["ld"] / max(nb, 1),
-                                    lr_at(step), sums["gn"] / max(nb, 1), val_bpd, round(train_seconds, 1),
-                                    round(sample_seconds, 1), n_nonfinite])
+                                    lr_at(step), sums["gn"] / max(nb, 1), val_bpd, val_robust, val_fail,
+                                    round(train_seconds, 1), round(sample_seconds, 1), n_nonfinite])
         msg = (f"{tag} epoch {epoch+1}/{tr['epochs']} loss {sums['loss']/max(nb,1):.4f} gn {sums['gn']/max(nb,1):.2f} "
                f"({train_seconds:.0f}s train, {dt:.0f}s total)")
         if val_bpd != "":
-            msg += f" val_bpd {val_bpd:.4f} (best {best[0]:.4f} @ {best[1]})"
+            msg += (f" val_bpd {val_bpd:.4f} (robust {val_robust:.4f}, {val_fail} above 10) "
+                    f"(best {best[0]:.4f} @ {best[1]})")
         if sample_seconds:
             msg += f" samples {sample_seconds:.0f}s" + (f" NONFINITE {n_bad}/{n_show}" if n_bad else "")
         if n_nonfinite:
@@ -270,7 +298,7 @@ def train(cfg, device, out_data, out_figs):
                   f"(best {best[0]:.4f} @ {best[1]})", flush=True)
         torch.save(model.state_dict(), out_data / "model.pth")
         torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch + 1, "step": step,
-                    "val_bpds": val_bpds, "best": list(best)}, ckpt_path)
+                    "val_bpds": val_bpds, "best": list(best), "val_stat": val_stat}, ckpt_path)
     train_minutes = (time.time() - t_start) / 60
 
     # ---- final evaluation (exact fp32) ---------------------------------
@@ -278,6 +306,7 @@ def train(cfg, device, out_data, out_figs):
     epochs_run = val_bpds[-1][0] if val_bpds else tr["epochs"]
     result = dict(n_params=n_params, config=cfg, train_minutes=round(train_minutes, 1), epochs_run=epochs_run,
                   stopped_early=bool(stopped_early), val_bpd_curve=val_bpds, best_val_bpd=best[0], best_epoch=best[1],
+                  val_stat=val_stat,
                   n_train=len(train_loader.dataset), images_per_epoch=len(sampler), n_val=len(val_loader.dataset),
                   n_test=len(test_loader.dataset), latent=dict(T=T, D=D))
     for which in ["final", "best"]:
@@ -360,6 +389,77 @@ def nearest_neighbour_check(samples, bundle, val_loader, device, out_figs, n_tra
 # figures + LaTeX fragments
 # --------------------------------------------------------------------------
 
+@torch.no_grad()
+def val_outliers(cfg, device, out_data, out_figs, which="best", thresh=10.0):
+    """Which validation slices blow up under a checkpoint, and how: per-image bpd on the
+    training run's validation subset; for every slice above `thresh` bpd the image, its
+    bpd, the max |z| after each block and the max |z| after the FIRST block per token
+    (where along the raster the blow-up starts). Writes data/val_outliers_<which>.json
+    and figures/val_outliers_<which>.png. Does not touch the training artefacts."""
+    set_tf32(False)
+    _, val_loader, _, _, _ = make_loaders(cfg, device)
+    model, path = load_prior(cfg, device, which)
+    rows, images, idx0 = [], [], 0
+    devs = [device.index] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devs):
+        torch.manual_seed(cfg["seed"])
+        for x, _ in val_loader:
+            x = s2.apply_noise(x.to(device), {"noise_type": "uniform"})
+            z, outputs, logdets = model(x)
+            n_dims = float(np.prod(x.shape[1:]))
+            b = (-s2.gaussian_log_prob(z) / n_dims - logdets) / math.log(2)
+            for i in torch.nonzero(b > thresh).flatten().tolist():
+                first_tok = int(outputs[0][i].abs().amax(-1).argmax())
+                rows.append(dict(index=idx0 + i, bpd=float(b[i]), max_abs_z_per_block=[float(o[i].abs().max()) for o in outputs],
+                                 first_block_worst_token=first_tok,
+                                 first_block_worst_token_rc=[first_tok // (cfg["img_size"] // cfg["patch_size"]),
+                                                             first_tok % (cfg["img_size"] // cfg["patch_size"])],
+                                 pixel_min=float(x[i].min()), pixel_max=float(x[i].max())))
+                images.append(x[i].cpu())
+            idx0 += x.size(0)
+    out = dict(checkpoint=str(path.relative_to(REPO_ROOT)), which=which, threshold_bpd=thresh, n_val=idx0,
+               n_outliers=len(rows), outliers=rows)
+    with open(out_data / f"val_outliers_{which}.json", "w") as f:
+        json.dump(out, f, indent=2)
+    if images:
+        n = len(images)
+        fig, axes = plt.subplots(1, n, figsize=(3.4 * n, 3.9), squeeze=False)
+        for ax, im, r in zip(axes[0], images, rows):
+            ax.imshow(im[0], cmap="gray", vmin=-1, vmax=1)
+            rc = r["first_block_worst_token_rc"]
+            ps = cfg["patch_size"]
+            ax.add_patch(plt.Rectangle((rc[1] * ps - 0.5, rc[0] * ps - 0.5), ps, ps, fill=False, color="r", lw=1))
+            mz = r["max_abs_z_per_block"]
+            ax.set_title(f"val slice {r['index']}: {r['bpd']:.3g} bpd\nmax|z| after each block: "
+                         + " ".join(f"{v:.0e}" for v in mz[:4]) + "\n" + " ".join(f"{v:.0e}" for v in mz[4:]), fontsize=7)
+            ax.axis("off")
+        fig.suptitle(f"LIDC {cfg['res']} px, {which} checkpoint: validation slices above {thresh:g} bpd ({n} of {idx0})\n"
+                     f"red square: the token with the largest |z| after block 1", fontsize=8)
+        fig.tight_layout(rect=(0, 0, 1, 0.9))
+        fig.savefig(out_figs / f"val_outliers_{which}.png", dpi=130)
+        plt.close(fig)
+    print(f"[step13:{cfg['res']}] val outliers ({which}): {len(rows)} of {idx0} above {thresh:g} bpd: "
+          + "; ".join(f"#{r['index']} {r['bpd']:.3g} bpd, max|z| " + " ".join(f"{v:.0e}" for v in r["max_abs_z_per_block"])
+                      for r in rows), flush=True)
+    return out
+
+
+def val_sentence(res):
+    """The checkpoint-selection statistic and the validation blow-ups, for the summary."""
+    curve = res.get("val_bpd_curve", [])
+    # (epoch, mean) entries predate the per-image validation; a mean above 10 bpd is a blow-up
+    failed = lambda v: (v[3] > 0) if len(v) > 3 else (v[1] > 10)
+    n_fail_epochs = sum(1 for v in curve if failed(v))
+    stat = ("mean over the validation images below 10 bpd" if res.get("val_stat") == "robust"
+            else "official mean")
+    s = f"Best val bpd {res['best_val_bpd']:.4f} (epoch {res['best_epoch']}; {stat}"
+    if n_fail_epochs:
+        worst = max((v[1], v[0]) for v in curve if failed(v))
+        s += (f"; on {n_fail_epochs} of the {len(curve)} evaluated epochs a few validation slices exceeded 10 bpd, "
+              f"the plain mean reaching {worst[0]:.3g} at epoch {worst[1]}")
+    return s + "); "
+
+
 def collect(cfg, out_data, out_figs):
     rows = list(csv.DictReader(open(out_data / "metrics.csv"))) if (out_data / "metrics.csv").exists() else []
     res = json.load(open(out_data / "result.json")) if (out_data / "result.json").exists() else None
@@ -369,10 +469,18 @@ def collect(cfg, out_data, out_figs):
         axes[0].plot(ep, [float(r["loss"]) for r in rows])
         axes[0].set(xlabel="epoch", ylabel="train loss (nats/dim)", title="training loss")
         bp = [(int(r["epoch"]), float(r["val_bpd"])) for r in rows if r["val_bpd"]]
+        rb = [(int(r["epoch"]), float(r["val_bpd_robust"])) for r in rows if r.get("val_bpd_robust")]
+        nf = [(int(r["epoch"]), int(r["val_n_fail"])) for r in rows if r.get("val_n_fail")]
         if bp:
-            axes[1].plot(*zip(*bp), marker="o", ms=3)
-            axes[1].set(xlabel="epoch", ylabel="val bits/dim", title="validation bpd")
-            lo = min(b for _, b in bp)
+            axes[1].plot(*zip(*bp), marker="o", ms=3, label="mean (official)")
+            if rb:
+                axes[1].plot(*zip(*rb), marker="s", ms=3, label="mean of images < 10 bpd")
+                axes[1].legend(fontsize=7)
+            for e, n in nf:                      # epochs on which some validation slices blew up
+                if n:
+                    axes[1].annotate(f"{n}", (e, min(b for _, b in bp) - 0.01), fontsize=6, ha="center", color="C3")
+            axes[1].set(xlabel="epoch", ylabel="val bits/dim", title="validation bpd (red: slices above 10 bpd)")
+            lo = min(b for _, b in bp + rb)
             axes[1].set_ylim(lo - 0.02, lo + 0.3)
         axes[2].plot(ep, [float(r["grad_norm"]) for r in rows])
         axes[2].set(xlabel="epoch", ylabel="mean grad norm (pre-clip)", title="gradient norm", yscale="log")
@@ -395,7 +503,7 @@ def collect(cfg, out_data, out_figs):
             f"[patch {res['config']['patch_size']}: $T={res['latent']['T']}$ tokens of dimension {res['latent']['D']}; "
             f"{m['channels']} ch, {m['blocks']} blocks, {m['layers_per_block']} layers] = {res['n_params']/1e6:.1f}M parameters, "
             f"batch {tr['batch']}, lr {tr['lr']:g}{', TF32' if res['config'].get('tf32') else ''}{', per-block activation checkpointing' if tr.get('block_checkpoint') else ''}, {schedule}, {minutes:.0f} min. "
-            f"Best val bpd {res['best_val_bpd']:.4f} (epoch {res['best_epoch']}); " + s9.test_bpd_sentence(res)
+            + val_sentence(res) + s9.test_bpd_sentence(res)
             + f"Final samples ({res['config']['train']['sample_nrow'] * res['config']['train']['sample_rows']}, "
             f"{res['final_sample_seconds']:.3g} s with the official sequential reverse): {res['final_samples_nonfinite']} non-finite, "
             f"{100*res['final_samples_frac_outside_range']:.2f}\\% of pixels outside $[-1,1]$. "
@@ -410,6 +518,8 @@ def main(argv=None):
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--collect", action="store_true")
+    ap.add_argument("--val-outliers", action="store_true",
+                    help="only probe the validation slices above 10 bpd under the best and final checkpoints")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     out_root = REPO_ROOT / cfg["output_root"]
@@ -417,6 +527,10 @@ def main(argv=None):
     out_data.mkdir(parents=True, exist_ok=True)
     out_figs.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
+    if args.val_outliers:
+        for which in ["best", "final"]:
+            val_outliers(cfg, device, out_data, out_figs, which)
+        return 0
     if not args.collect:
         train(cfg, device, out_data, out_figs)
     collect(cfg, out_data, out_figs)

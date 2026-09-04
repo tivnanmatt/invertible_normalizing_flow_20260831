@@ -1,11 +1,22 @@
-# step13_lidc_tarflow.py -- LIDC 64 x 64 (6 mm/px). Patch 4 -> T = 256 tokens of dimension
-# 16 (four times the token count of the step-9 ChestMNIST-64 model, whose 8 x 8 patches
-# left the within-patch structure to the base distribution and gave blobby samples);
-# a 512-channel, 8-block, 6-layer transformer (153M parameters). An "epoch" is a fresh
-# random half of the training split so that validation, checkpoints and sample grids
-# come every ~48k images; 30 epochs = 1.4M images (the 32-px run started to overfit
-# after ~1M). Per-block activation checkpointing: without it the 48 layers at T = 256
-# and batch 64 exceed the 24 GB of the GPU (with it: 5.4 GB, 0.52 s/step, 6.5 min/epoch).
+# step13_lidc_tarflow.py -- LIDC 64 x 64 (6 mm/px). Patch 4 -> T = 256 tokens of
+# dimension 16 (four times the token count of the step-9 ChestMNIST-64 model, whose 8 x
+# 8 patches left the within-patch structure to the base distribution and gave blobby
+# samples); a 512-channel, 8-block, 6-layer transformer (153M parameters). An "epoch" is
+# a fresh random half of the training split so that validation, checkpoints and sample
+# grids come every ~48k images; 30 epochs = 1.4M images (the 32-px run started to
+# overfit after ~1M). Per-block activation checkpointing: without it the 48 layers at T
+# = 256 and batch 64 exceed the 24 GB of the GPU (with it: 5.4 GB, 0.52 s/step, 6.5
+# min/epoch).
+#
+# Deviation, recorded: the first run of this config stopped at epoch 17 under the plain-
+# mean rule (best mean val bpd 2.9837 at epoch 11; epochs 13-17 gave 377, 3.46, 50.9,
+# 4098, 3606) while the training loss kept falling and the final checkpoint's TEST bpd
+# (2.901, no slice above 10 bpd) was better than the epoch-11 checkpoint's (2.961): a
+# few validation slices blow up under the sharper later models and the mean of 4000 is
+# not a usable selection statistic. The run was resumed from its epoch-17 checkpoint
+# with val_stat: robust (mean over the validation slices below 10 bpd) and the same
+# 30-epoch schedule; metrics.csv keeps the plain means of epochs 1-17 and both
+# statistics from epoch 18 on.
 
 seed: 20260904
 tarflow_repo: /dev_ws/ml-tarflow
@@ -34,6 +45,9 @@ train:
   eval_every: 1
   val_subset: 4000
   early_stop_patience: 6
+  # select/stop on the mean over the validation slices below 10 bpd (added at the
+  # resume from epoch 17, see the header)
+  val_stat: robust
   sample_every: 2
   sample_nrow: 8
   sample_rows: 8

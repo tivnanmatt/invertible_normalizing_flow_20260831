@@ -8,6 +8,26 @@
 # stated for a 64-px image and scaled with the side N so the task stays the same:
 # the box covers 3/8 of the side, CT keeps N/4 views (a constant 6x under-sampling of
 # the ~pi N / 2 Nyquist number) and a sinogram noise proportional to the ray length.
+#
+# Deviation, recorded. The first 32- and 64-px galleries ran the six systems one after
+# the other with 300 Adam steps each (the step-11 protocol shortened to keep the
+# sequential reverse affordable: 2.4 s per step at T = 256, 72 min per gallery). At
+# 64 px that was not converged -- for box inpainting all three restarts ended
+# thousands of nats above the truth's objective, with the data term far above the noise
+# level -- so the script was changed to optimise all systems' restarts as ONE batch of
+# 18 (the reverse is latency-bound, so this costs the same per step as one system)
+# and `iters` was raised to the step-11 value of 1000. Both first runs are kept under
+# outputs/step14_lidc_gallery/first_runs_300_steps/ and quoted in the paper.
+#
+# Second deviation, recorded. The batched 32- and 64-px galleries ran through
+# invlib.FastReverse, whose token step passes the whole KV cache through functionally
+# (O(B T^2) memory traffic per pass): 0.28 s per step at T = 64 but 7.7 s at T = 256 with
+# the batch of 18, which extrapolates to about a minute per step at T = 1024. The 128-
+# and 256-px galleries therefore use invlib.FastReverse2 (`reverse: fast2`), the same
+# recursion with the cache written in place and its gradient deferred per chunk of
+# token steps. check_fast_reverse2 on the trained 32/64-px priors: x, log q and dJ/dz
+# agree with FastReverse to 2e-5 / 6e-7 / 4e-5 (fp32 operation order); a forward+backward
+# pass at batch 18 takes 3.1 s at T = 256 (7.7 s before) and 17.2 s at T = 1024.
 
 seed: 20260913
 output_root: outputs/step14_lidc_gallery
@@ -18,9 +38,11 @@ priors:
   128: configs/step13_lidc_tarflow_128.yml
   256: configs/step13_lidc_tarflow_256.yml
 
-restarts: 3                    # independent N(0, I) inits, run as one batch through the
-                               # CUDA-graph reverse
-iters: 300
+restarts: 3                    # independent N(0, I) inits per system; all systems' restarts
+                               # run as one batch through the CUDA-graph reverse
+iters: 1000                    # the step-11 count (300 in the archived first runs, see above)
+reverse: fast2                 # in-place-cache reverse (see above; 32 and 64 px ran with the first one)
+chunk: 128                     # token steps per captured graph and per deferred cache-gradient update
 lr: 0.1                        # Adam on z, cosine to lr_min (the step-11 sweep: lr 0.1
                                # best, >= 0.5 drifts)
 lr_min: 0.005

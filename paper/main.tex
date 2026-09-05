@@ -3508,6 +3508,98 @@ the numbers in parentheses below).
         and the two hardest systems are stuck short of their minima, so the
         comparison says more about the optimiser than about the prior.
 \end{itemize}
+\paragraph{128 px (32 views, $T = 1024$).}
+\begin{itemize}
+  \item \textbf{No system reaches the noise level, and two never reach the
+        truth's objective.} The trend of the 64-px rung continues: the
+        best restart's residual RMS on the observed data is $1.08\sigma$
+        (denoising, data term 1956 against a noise level of 535), $1.05\sigma$
+        ($4\times$ SR, $-1561$ vs.\ $-1615$), $1.30\sigma$ (CT, 14369 vs.\
+        12368), $1.35\sigma$ ($2\times$ SR, $-4808$ vs.\ $-6459$), $1.71\sigma$
+        (random inpainting, $-3020$ vs.\ $-7764$) and $1.83\sigma$ (box
+        inpainting, $-5658$ vs.\ $-22201$), where at 32 px every system and at
+        64 px four of six ended at the noise level. Four systems still end
+        below the truth's $J_z$ --- denoising 19420 vs.\ 23413, $2\times$ SR
+        13413 vs.\ 15882, $4\times$ SR 14734 vs.\ 20568, CT 33668 vs.\ 33699
+        (31 nats, a tie) --- but they do it by shrinking the latent, not by
+        fitting the data: the denoising MAP pays 1500 nats more than the
+        truth in its data term and saves 5500 in $\|z\|^2/2$ (2408 against
+        7901). Random inpainting ends 3500 nats above the truth (18675 vs.\
+        15155) and box inpainting 17\,000 above ($+16567$ vs.\ $-620$), with
+        residuals of $1.7$--$1.8\sigma$ on the observed pixels: at 64 px box
+        inpainting's best restart beat the truth by 580 nats at the noise
+        level. The truth's latents sit at $\|z\| = 112$--$126$, on the
+        prior's shell of $\sqrt{TD} = 128$; the optimiser, started from
+        $\mathcal{N}(0, I)$ draws of the same norm, does not find its way
+        to points of that quality in 1000 steps.
+  \item \textbf{(i) holds, and the restarts now diverge as well as
+        differ.} The three restarts of every system end at different
+        objectives (spreads 0.095 for $2\times$ SR, 0.164 random, 0.187
+        denoising, 0.205 $4\times$ SR, 0.248 box, 0.763 CT), and the data
+        terms of the worse minima are above the noise level in every
+        system. But five of the 18 restarts end \emph{above} their own best
+        objective along the trajectory --- the gallery records the final
+        iterate --- and three of those are failures of the optimisation
+        rather than local minima: CT's second restart reached $J_z =
+        254\,205$ and ended at $383\,262$ (data term 29 times the noise
+        level, PSNR 9.9 dB, $\|z\| = 161$), its third never went below its
+        initial $311\,309$ and ended at $1\,358\,807$ (7.6 dB, $\|z\| =
+        186$; both images are blown-out fragments of a thorax), and random
+        inpainting's second restart passed through 17\,373 --- which would
+        have been the lowest of its three --- and ended at 29\,206 (data term
+        $+9004$ against $-7764$). Denoising's third restart (25\,965, best
+        23\,525) ends at 19.0 dB with horizontal streaks across the
+        mediastinum, $4\times$ SR's first (18\,660, best 17\,886) with the
+        lung fields flattened to a plateau. Eight of the 18 restarts end
+        with a pixel beyond 1.2 (the window is $[-1, 1]$; $2\times$ SR's
+        first at 3.3, $4\times$ SR's second at 5.7, CT's two divergent ones
+        at 2.6 and 3.3); at 64 px two did. The cosine schedule ends at a
+        learning rate of 0.005 and still does not tame them. A plausible
+        reason, not tested here: Adam's step is a learning rate per
+        coordinate regardless of curvature, and the step-16 mass matrix
+        measured at these three MAPs (diagonal Hessian of $U$, 32 probes)
+        has a median of 23, 1.1 and 6.3 but maxima of $5.5 \times 10^{4}$,
+        $9.1 \times 10^{4}$ and $5.3 \times 10^{4}$ (denoising, $4\times$
+        SR, CT): a step of 0.1 along one such coordinate changes $U$ by
+        $\tfrac12 h\,(0.1)^2 = 270$--$460$ nats, enough to throw a restart out of its basin and, at the CT
+        system with its $\sigma = 2$ sinogram, out of the window.
+  \item \textbf{(ii) holds.} $\|z\|$ at the best restart is 50 ($4\times$
+        SR), 69 (denoising), 80 ($2\times$ SR), 92 (CT), 115 (random
+        inpainting) and 120 (box inpainting) against the shell at 128, the
+        ordering of the two lower rungs with CT one place earlier; the two
+        inpainting systems, whose minimisation is furthest from converged,
+        are also the two nearest the shell.
+  \item \textbf{Denoising: the noise-fitting is gone, and so is the
+        detail.} At 32 and 64 px the lowest denoising objective fitted part
+        of the noise (residual variance 68\% and 87\% of $\sigma^2$); at 128
+        px the best restart's residual is $1.17\sigma^2$, above the noise
+        level, and its PSNR 23.6 dB is 1.6 dB below the 64-px best. The
+        image is smoother than the truth --- the small vessels of the lung
+        fields are gone --- which is what a latent of norm 69 on a prior
+        whose typical draws have norm 128 produces: the MAP of the 128-px
+        posterior is a low-detail point of the prior, and the posterior mean
+        the step-16 walk estimates from this start is the fairer object to
+        compare across rungs.
+  \item \textbf{Cost (iii): the second reverse delivers what the Methods
+        measured.} 17.3 s per Adam step for 18 rows at $T = 1024$ once the
+        GPU was its own (steps 700--999; the Methods' isolated measurement
+        was 17.2 s), a graph build of 0.9 s against 12.3 s at 64 px, and
+        0.96 s per restart-step against 0.43 s at $T = 256$: a factor 2.2
+        for four times the tokens, where the first reverse's $BT^{2}$ cache
+        traffic would have given the extrapolated minute per step. The
+        wall-clock was 29\,721 s (8.3 h, 29.7 s per step) because the run
+        shared the GPU with the step-16 walks at 32 and 64 px for its first
+        600 steps (55 s per step during the first hundred, 37 s during the
+        next five hundred).
+  \item \textbf{(iv), again not testable by PSNR.} The best-restart PSNRs
+        are 23.6 (denoising), 18.7 (box), 25.0 (random), 26.9 ($2\times$
+        SR), 23.6 ($4\times$ SR) and 22.9 dB (CT) against 25.2, 18.4, 23.9,
+        28.1, 23.5 and 25.6 at 64 px: three down by 1.2--2.7 dB, three up by
+        at most 1.1, on images with twice the linear detail and with no
+        system at its minimum. The step-16 walk at this rung starts from
+        the best restarts of denoising (restart 2, $\|z\| = 69$), $4\times$
+        SR (restart 3, 50) and CT (restart 1, 92).
+\end{itemize}
 %% STEP14_ANALYSIS_128
 
 \section{Step 15: Latent initialisation, pixel-domain refinement}
@@ -4108,7 +4200,7 @@ initial state, the two last states, the posterior mean and std.}
 \end{figure}}{}
 \IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_inpaint_traces.png}{%
 \begin{figure}[htbp]\centering
-\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_inpaint_traces.png}
+\includegraphics[width=\textwidth,height=0.92\textheight,keepaspectratio]{outputs/step16_latent_langevin/figures/langevin_32_inpaint_traces.png}
 \caption{32 px, traces of the inpainting run (MAP start, mean over the
 two chains).}
 \label{fig:step16inpainttraces32}
@@ -4438,8 +4530,12 @@ measurement, the initial state, the last state, the mean and std of the
         10^{-3}$ and $1.1 \times 10^{-2}$ --- a displacement of
         $L\varepsilon \approx 0.2$--$0.7$ per iteration against a shell of
         radius 32 --- so the 32 frames were strongly correlated (lag-one
-        autocorrelation of the pixels 0.55, 0.56 and 0.42, i.e.\ about
-        9--13 effectively independent frames) and its ``posterior means''
+        autocorrelation of the pixels --- the covariance of consecutive
+        recorded frames over their variance, both pooled over the pixels,
+        computed from the \texttt{\_frames.npz} by
+        \texttt{scratch/walk\_stats2.py} --- 0.55, 0.58 and 0.43, i.e.\
+        about 9--13 effectively independent frames under an AR(1) count
+        $32\,(1-\rho)/(1+\rho)$) and its ``posterior means''
         (25.2, 24.5, 27.0 dB) were averages of a short segment of the
         chain. The same step sizes made the 64-px walk stall (next
         bullet), which is what led to the mass matrix of the Methods. The
@@ -4472,7 +4568,7 @@ measurement, the initial state, the last state, the mean and std of the
         with unit mass), concentrated on the lung boundaries and the
         mediastinum for denoising and CT and on the body outline and the
         mediastinum for $4\times$ SR. The frames are now nearly
-        independent: lag-one pixel autocorrelation 0.09, 0.07 and 0.08,
+        independent: lag-one pixel autocorrelation 0.06, 0.08 and 0.08,
         and the r.m.s.\ difference between consecutive frames (0.108,
         0.108, 0.082) is at or above $\sqrt{2}$ times the std map, the
         value for independent draws. The 32-sample means agree with the
@@ -4507,7 +4603,7 @@ measurement, the initial state, the last state, the mean and std of the
         of them ran away (iterations 26 and 42; rejected by the guard, no
         reset). So the 32 recorded frames contain 14 (denoising), 7
         ($4\times$ SR) and 20 (CT) distinct states, with lag-one pixel
-        autocorrelations 0.58, 0.76 and 0.56: the videos at this rung
+        autocorrelations 0.62, 0.81 and 0.57: the videos at this rung
         show a chain that moves, not independent draws. Where the chains
         are: CT on the shell ($\|z\|$ 65.2) with a residual 1.17 times
         the truth's, still falling in the trace (1.39 at the MAP); $4\times$
@@ -4526,6 +4622,74 @@ measurement, the initial state, the last state, the mean and std of the
         with adaptation iterations left after the last refresh
         (\texttt{--mass-refresh 6,14} of a 20-iteration burn-in, below).
 %% STEP16_ANALYSIS_WALK_64
+  \item \textbf{The walk at 128 px (\texttt{\_walk}, $n = 16384$, shell
+        radius 128): on the shell, accepting, still correlated.} The
+        late-refresh protocol ($L = 32$, 52 iterations, 20 burn-in, mass
+        re-estimated at iterations 6 and 14; Figure~\ref{fig:step16walk128},
+        traces in Figure~\ref{fig:step16walktraces128}); 4.6 h at 9.9 s
+        per gradient with the GPU to itself (305 s per iteration, 305 s
+        per mass estimate), from the best restarts of the 128-px gallery
+        ($\|z\|$ 69.4, 49.8 and 92.1). The stiffness at the MAP is
+        \emph{lower} than at the 64-px MAPs (maxima 55285, 91362 and 52688
+        for denoising, $4\times$ SR and CT against 1154439, 94112 and
+        784911), but it grows as the chains climb, as at 64 px: 52713,
+        94253 and 500957 at iteration 6 and 275719, 104546 and 1207672 at
+        iteration 14 --- five and 23 times the MAP values for denoising and
+        CT, unchanged for $4\times$ SR. Iteration 0 was rejected by all
+        three chains at $\varepsilon \approx 0.06$ (at 32 and 64 px it was
+        accepted), and the denoising chain ran away twice during the
+        burn-in (iterations 8 and 13; rejected by the guard, no reset); the
+        adaptation brought the steps down to $2.1 \times 10^{-2}$, $2.3
+        \times 10^{-2}$ and $3.3 \times 10^{-2}$ by iteration 20 and, because
+        the last refresh preceded the end of the adaptation, the sampling
+        phase accepted: 0.40 / 0.66, 0.35 / 0.75 and 0.70 / 0.84 (burn-in /
+        sampling; median acceptance probabilities 0.97, 0.96 and 1.00 in
+        the sampling phase, where the 64-px $4\times$ SR chain had 0.00).
+        $4\times$ SR and CT reached the shell by iteration 20 ($\|z\|$
+        126.7 and 126.5; 127.1 and 128.2 at the end); denoising went from
+        69.4 to 105.2 in the burn-in and 111.4 at iteration 51, still
+        climbing at 0.2 per iteration, with its energy 130 nats below
+        the truth's (8228 against 8357) --- the third rung at which the
+        denoising chain from the MAP stops short of the shell and of the
+        truth's energy, this time 17 units short. Its residual did not move
+        at all while $\|z\|$ grew by 42 (1.17 at the MAP, 1.18 throughout):
+        the climb is along directions the measurement does not see. The
+        $4\times$ SR chain ends at the noise level (0.99; 1.11 at the MAP)
+        and 945 nats above the truth's energy (6457 vs.\ 5512); CT at 1.53
+        (1.68 at the MAP; the trace is still falling, as at 64 px) and 3486
+        nats above the truth's (22129 vs.\ 18643), of which 1526 are the
+        data term and 1960 the prior: the truth's latent has $\|z\| =
+        111.8$ for this slice, and a chain on the shell at 128 pays for
+        the extra radius. Frames: 21, 24 and 27 distinct states among the
+        32, lag-one pixel autocorrelation 0.68, 0.72 and 0.61 (about 5--8
+        effectively independent frames under an AR(1) count), and the
+        r.m.s.\ difference between consecutive frames 0.44--0.56 of the
+        value for independent draws (0.015 / 0.040 / 0.023 against
+        $\sqrt2$ times the std maps 0.033 / 0.090 / 0.041). The chains move
+        further per iteration than at 64 px (they are accepting) and are
+        still correlated because the trajectories are short: $L\varepsilon$
+        is 0.7--1.2 here against 2.2--4.3 at 64 px and 3--5 at 32 px, where
+        the frames were independent. Independent frames at this rung would
+        need trajectories four to six times longer, or the same factor in
+        thinning --- some 18--28 h for 32 frames at 9.9 s per gradient.
+        PSNR of the last state / the samples on average / the 32-sample
+        mean: 23.3 / 23.4 / 23.5 dB for denoising (MAP 23.6), 22.9 / 22.6
+        / 23.4 for $4\times$ SR (MAP 23.6), 23.3 / 23.3 / 23.5 for CT (MAP
+        22.9). The samples are within 1.0 dB of the MAP in every system
+        (at 32 px the $4\times$ SR and CT samples were 2.3--2.5 dB below
+        it) and the means within 0.6 dB (the denoising mean was 3.8 dB
+        above the MAP at 32 px and 0.4 above at 64 px): at this rung the
+        MAP, a sample and the mean are the same image to within a
+        decibel. With 5--8 effective samples the means are not converged,
+        so this is a statement about the chain, not the posterior. Std maps 0.012,
+        0.041 and 0.013, on the vessels and the mediastinal edges for
+        denoising and CT and over the whole soft-tissue interior for
+        $4\times$ SR, whose $32 \times 32$ measurement constrains the
+        interior least; visually the $4\times$ SR samples put plausible
+        vessel-like texture where the MAP had a flat plateau, and the
+        denoising and CT samples are the MAP with a slightly different
+        rendering of the small vessels. The videos are the 32 recorded
+        states at 4 frames per second.
 %% STEP16_ANALYSIS_WALK_128
 %% STEP16_ANALYSIS_32_STIFF_MORE
 \end{itemize}
@@ -4539,6 +4703,11 @@ measurement, the initial state, the last state, the mean and std of the
   \item \texttt{outputs/} and dataset caches are gitignored; the committed
         code + config + this PDF are the record, and any output can be
         regenerated with the commands above.
+  \item The probe scripts this text cites as \texttt{scratch/*.py} were
+        written in a scratch directory outside the repository; the ones
+        cited are committed under \texttt{scratch/} as they were run
+        (absolute \texttt{/dev\_ws} paths included), without the step
+        scripts' config and output conventions.
   \item Provenance for the run in this PDF:
 \end{itemize}
 {\scriptsize

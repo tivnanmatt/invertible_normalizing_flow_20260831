@@ -1,0 +1,38 @@
+# step16_latent_langevin.py, third configuration: the two inpaintings to convergence.
+# The `_stiff` run (128 leapfrog steps, 30 iterations) brought denoising and 2x
+# super-resolution to the shell but left both inpaintings climbing: box from ||z|| 20 to
+# 26--28, random from 16 to 24--26, both still rising linearly at iteration 30, and the
+# random chains at acceptance 0.38--0.45 because the adaptation froze after 8 iterations
+# before the step size had come down. Same sampler, same target, same trajectories, three
+# times the iterations, a longer adaptation, and a smaller initial step for the random
+# chains' sake; only the two inpaintings, from the latent MAP and from the latent MLE.
+# Output files carry the tag `_inpaint`. Batch 8 (2 systems x 2 variants x 2 chains),
+# 11,520 gradients at ~0.45 s each while sharing the GPU with the 128-px training.
+
+seed: 20260904
+output_root: outputs/step16_latent_langevin
+step14_config: configs/step14_lidc_gallery.yml
+tag: _inpaint
+systems: [inpaint_box, inpaint_random]
+
+chains: 2
+iterations: 90
+leapfrog: 128
+burn_in: 30
+adapt_iters: 25
+target_accept: 0.65
+eps0: 1.5e-3                    # between the box (1.4e-3) and random (1.8e-3) values of the _stiff run
+adapt_rate: 0.2
+eps_jitter: 0.2
+
+mle:
+  steps: 300
+  lr: 2.0e-2
+
+variants:
+  - {name: posterior_from_map, init: map, temperature: 1.0, prior_scale: 1.0}
+  - {name: posterior_from_mle, init: mle, temperature: 1.0, prior_scale: 1.0}
+
+video:
+  fps: 8
+  dpi: 100

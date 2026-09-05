@@ -178,10 +178,13 @@ def run(cfg, res, device, out_data, out_figs, iterations=None, burn_in=None):
 
     torch.cuda.synchronize()
     t0 = time.time()
-    fr = invlib.FastReverse(prior, B, device, mode="compile")
+    if cfg.get("reverse") == "fast2":    # in-place-cache reverse (step 14's choice at T = 1024; same (x, log_q) interface)
+        fr = invlib.FastReverse2(prior, B, device, chunk=int(cfg.get("chunk", 128)), mode="graph")
+    else:
+        fr = invlib.FastReverse(prior, B, device, mode="compile")
     torch.cuda.synchronize()
     build_s = time.time() - t0
-    print(f"{tag} graph build {build_s:.1f} s (batch {B})", flush=True)
+    print(f"{tag} graph build {build_s:.1f} s (batch {B}, {cfg.get('reverse', 'fast')})", flush=True)
 
     def energy(z):
         """U, grad U, x = g(z) and the data term, per row."""
@@ -292,7 +295,7 @@ def run(cfg, res, device, out_data, out_figs, iterations=None, burn_in=None):
     res_json = dict(res=res, prior=str(ckpt), latent=dict(T=T_, D=D), n=n, sqrt_n=math.sqrt(n), batch=B, chains=C,
                     iterations=K, leapfrog=L, burn_in=K_burn, adapt_iters=K_adapt, eps0=cfg["eps0"], target_accept=target,
                     eps_jitter=jit, variants=variants, mle=mle_stats, seconds=total, iter_seconds=float(np.mean(ts)),
-                    grad_seconds=float(np.mean(ts)) / L, graph_build_seconds=build_s,
+                    grad_seconds=float(np.mean(ts)) / L, graph_build_seconds=build_s, reverse=cfg.get("reverse", "fast"),
                     indices=[gal["indices"][i] for i in keep_idx], systems=[sp["name"] for sp in systems], rows=rows)
     json.dump(res_json, open(out_data / f"{stem(cfg, res)}.json", "w"), indent=1)
     np.savez_compressed(out_data / f"{stem(cfg, res)}_frames.npz", frames=frames, **{f"trace_{k}": v_ for k, v_ in tr.items()})
@@ -424,6 +427,7 @@ def video(cfg, res, out_data, out_figs, only=None):
     rows_of = lambda s, v: slice((s * V + v) * C, (s * V + v + 1) * C)
     frames = Fz["frames"]
     fps, dpi = int(cfg["video"]["fps"]), int(cfg["video"]["dpi"])
+    k_start = K_burn if cfg["video"].get("sampling_only", False) else 0     # frames = the recorded samples only
     ncol = C + 2
     to01 = lambda a: (np.clip(a, -1, 1) + 1) / 2
     for s, spec in enumerate(systems):
@@ -465,8 +469,8 @@ def video(cfg, res, out_data, out_figs, only=None):
         acc_sq = {v: np.zeros_like(x_true, dtype=np.float64) for v in range(V)}
         n_acc = {v: 0 for v in range(V)}
         with writer.saving(fig, str(path), dpi):
-            for k in range(K):
-                phase = "burn-in" if k < K_burn else "sampling"
+            for k in range(k_start, K):
+                phase = "burn-in" if k < K_burn else f"sample {k - K_burn + 1} of {K - K_burn}"
                 sup.set_text(f"LIDC {res}$\\times${res}, {spec['label']}: HMC on the latent posterior, iteration {k} of {K} "
                              f"({L} leapfrog steps each; {phase}, burn-in {K_burn})\nrows = variants, columns = chains, "
                              f"running posterior mean, running posterior std")
@@ -500,7 +504,7 @@ def video(cfg, res, out_data, out_figs, only=None):
                                      f"res {resid:.2f}$M\\sigma^2$")
                 writer.grab_frame()
         plt.close(fig)
-        print(f"[step16:{res}] {path.name}: {K} frames, {time.time() - t0:.0f} s", flush=True)
+        print(f"[step16:{res}] {path.name}: {K - k_start} frames, {time.time() - t0:.0f} s", flush=True)
 
 
 def _tex(s):

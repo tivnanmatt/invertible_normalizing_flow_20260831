@@ -3087,7 +3087,121 @@ and \texttt{metrics.csv}.
         epoch, 173 minutes for the 26 epochs; the official sequential
         reverse draws 64 samples in 2.9 s.
 \end{itemize}
+
+\paragraph{128 px (3 mm/px).}
+\begin{itemize}
+  \item \textbf{(i) holds; this rung is under-trained rather than
+        over-fitted.} With the robust statistic from the start, validation
+        bits/dim falls monotonically through all 30 epochs --- 3.383, 3.039,
+        2.927, 2.843 for epochs 1--4, 2.685 at 10, 2.604 at 20, 2.5819 at 30
+        --- and never turns up; the best checkpoint is the last one and the
+        early-stop rule was never triggered. The curve is still falling by
+        0.003 per epoch at epochs 26--29 and flattens at 29 $\to$ 30 only
+        because the cosine schedule has brought the learning rate to
+        $10^{-6}$: 30 epochs of 24,000 images are 7.5 passes over the
+        95,947 slices, against 13 passes at 64 px, where over-fitting set in
+        at 10. A longer schedule would improve this model; it was not run,
+        because the rung's job is the ladder and the 128-px measurement
+        systems, not the best possible 128-px prior. The test set agrees
+        with the validation set to the claimed precision: 2.5980 bits/dim
+        over the 12,135 test slices below 10 bits/dim (median 2.635), 0.016
+        \emph{above} the validation value (at 64 px it was 0.014 below). Per
+        pixel the model is $0.30$ bits/dim better than the 64-px one and
+        $1.05$ better than the 32-px one (test values), the same direction as before with
+        a smaller step, as expected when the added pixels carry more
+        sub-structure and less redundancy than the 6-mm ones did.
+  \item \textbf{The blown-up batches are single steps and did nothing.} The
+        training-loss column of \texttt{metrics.csv} reads $10^{22}$ to
+        $10^{23}$ nats/dim with an infinite gradient norm for epochs 17 and
+        21--26, and $-3.94$ to $-3.98$ for the others. Each of those is
+        \emph{one batch} of the 1500 whose latent overflowed (the running
+        mean is a sum divided by a count; between consecutive log lines
+        within such an epoch the sum did not change, so the $10^{26}$-nat
+        batch occurred once and the remaining batches were ordinary). With
+        \texttt{grad\_clip: 1.0}, an infinite pre-clip norm gives a clip
+        coefficient of $1/\infty = 0$: the gradient is zeroed and the step
+        moves the weights only by Adam's momentum and the weight decay. The
+        validation curve is monotone through every one of those epochs
+        (2.6211, 2.6020, 2.5971, 2.5941, 2.5912, 2.5885, 2.5876 at 17 and
+        21--26), which is the direct check that the weights were not
+        harmed. The plotted gradient norm (finite epochs only) is 346 at
+        epoch 1, 14--19 for epochs 2--20 and 44--60 for 27--30; the late
+        rise, at a learning rate of $10^{-6}$ or less, has no effect on the
+        weights and is not the over-fitting signature it was at 64 px,
+        where it came with a rising validation curve.
+  \item \textbf{The outlier slice, 1 in 12,136.} The validation probe
+        (\texttt{--val-outliers}) finds none of the 2000 validation slices
+        above 10 bits/dim under the best checkpoint (maximum 4.27), so the
+        robust and plain validation means coincide. The test split has
+        exactly one: slice 1758 scores $3.9 \times 10^{21}$ bits/dim and
+        alone lifts the plain mean to $3.2 \times 10^{17}$. It is a
+        lower-chest section that looks unremarkable at a glance
+        (Figure~\ref{fig:step13worst128}): lung fields, heart, a normal
+        table --- and a faint one-pixel contour in the air outside the
+        chest wall (a lead or a fold of sheet), the same class of
+        out-of-body feature as the two 64-px validation outliers. The chain
+        is the one described for 64 px, one block later and steeper: the
+        maximum $|z|$ after the eight blocks is 9.8, 11.1, 147, $6.8 \times
+        10^{3}$, $6.7 \times 10^{5}$, $3.1 \times 10^{8}$, $6.6 \times
+        10^{10}$, $6.0 \times 10^{12}$, a factor of 50--460 per block, all
+        within the per-block bound of $e^{8} = 2981$. One coordinate of
+        $6 \times 10^{12}$ contributes $z^{2}/2 = 1.8 \times 10^{25}$ nats,
+        which over 16,384 pixels is $1.6 \times 10^{21}$ bits/dim: again one
+        or a few coordinates carry the whole excess. The rate has fallen
+        from 2 in 4000 (64 px) to 1 in 12,136, with the caveat that the
+        128-px validation subset is 2000 slices and contained none.
+  \item \textbf{(ii) holds for 29 of 32 samples.} All 32 are finite and
+        0.99\% of pixels leave $[-1,1]$ (3.2\% at 64 px, 4.2\% at 32 px:
+        the ends of the window tighten with resolution). Twenty-nine are
+        chest or upper-abdominal sections with the anatomy of a 3-mm slice:
+        lung fields containing vessel dots and short branching segments
+        that radiate from the hila, the trachea or a main bronchus as a
+        dark ring in the mediastinum, the heart and the aorta as separate
+        bright shapes, the spinal canal, ribs and scapulae, subcutaneous fat
+        distinct from muscle, the liver and the bowel gas of the abdominal
+        sections, and the curved table with its pad. Three are not: a body
+        outline filled with a grainy texture instead of organs (row 1,
+        column 3), a noisy disc (row 4, column 2), and a flat grey square
+        with dark holes and no body outline (row 4, column 7); two more
+        have a torn or flattened outline with streaks above it. The failure
+        modes are whole-image ones (the sample is not a slice at all) rather
+        than local ones, and their rate, 3--5 of 32, is higher than at 64
+        px, where the equivalent count was ``a few'' of 64.
+  \item \textbf{(iii) holds.} Nearest-training RMS distance 0.354 for the
+        16 samples checked against $0.326 \pm 0.057$ for validation slices
+        (minimum 0.175 over 2000; closest sample 0.235). The samples are, on
+        average, farther from the 20,000-slice training subset than an
+        unseen slice is; the distances themselves rise along the ladder
+        (0.229, 0.276, 0.354 for the samples; 0.229, 0.293, 0.326 for
+        validation) because the finer the pixel the less two different
+        patients share.
+  \item \textbf{(iv), 64 $\to$ 128, holds for vessels and bronchi; fissures
+        are not resolved.} Side by side with the 64-px grid, the 128-px
+        samples add the vascular tree inside the lung (dots and branching
+        segments, densest near the hila, rather than a few isolated dots),
+        the airways (trachea, main bronchi), the separate outlines of heart
+        and great vessels, and the scapulae and the fat--muscle boundary in
+        the chest wall. Fissures --- a one-pixel line at 3 mm --- are not
+        visible in the samples, nor convincingly in the 32 training slices
+        beside them; that judgement moves to 256 px.
+  \item \textbf{Cost.} 155.7M parameters (patch 4, $T = 1024$ tokens of
+        dimension 16, 512 channels, $8 \times 6$ layers) at batch 16 with
+        per-block checkpointing: 0.84 s per step, 21 minutes per 24k-image
+        epoch when the GPU was not shared (epochs 14--20 took 25--45 minutes
+        because the 32-px step-14 to step-16 jobs ran alongside), 776
+        minutes of wall time for the 30 epochs; the official sequential
+        reverse draws 32 samples in 23.7 s.
+\end{itemize}
 %% STEP13_ANALYSIS_128
+
+\IfFileExists{../outputs/step13_lidc_tarflow_128/figures/test_worst_image_best.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.3\textwidth]{outputs/step13_lidc_tarflow_128/figures/test_worst_image_best.png}
+\caption{128 px: the one test slice (index 1758 of 12,136) at which the
+best checkpoint blows up ($3.9 \times 10^{21}$ bits/dim). A lower-chest
+section with a faint one-pixel contour in the air outside the chest wall.}
+\label{fig:step13worst128}
+\end{figure}}{}
 
 \IfFileExists{../outputs/step13_lidc_tarflow_64/figures/val_outliers_best.png}{%
 \begin{figure}[htbp]\centering
@@ -3853,6 +3967,8 @@ blue, prior-sample initialisation in orange.}
 \subsection{Configuration (verbatim)}
 {\small\verbatiminput{../configs/step16_latent_langevin.yml}}
 {\small\verbatiminput{../configs/step16_latent_langevin_stiff.yml}}
+{\small\verbatiminput{../configs/step16_latent_langevin_inpaint.yml}}
+{\small\verbatiminput{../configs/step16_latent_langevin_walk.yml}}
 
 \subsection{Results}
 Each line reports, per system and variant, the sampling-phase acceptance,
@@ -3897,6 +4013,85 @@ iteration.}
 \includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_stiff_traces.png}
 \caption{32 px, traces of the $L = 128$ run.}
 \label{fig:step16stifftraces32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_inpaint.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_inpaint.png}
+\caption{32 px, the two inpaintings to convergence ($L = 128$, 90
+iterations, two chains from the latent MAP): truth, measurement, the
+initial state, the two last states, the posterior mean and std.}
+\label{fig:step16inpaint32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_inpaint_traces.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_inpaint_traces.png}
+\caption{32 px, traces of the inpainting run (MAP start, mean over the
+two chains).}
+\label{fig:step16inpainttraces32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_walk.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_walk.png}
+\caption{32 px, one random walk per system ($L = 64$, 24 burn-in
+iterations, 32 recorded samples, from the latent MAP): truth,
+measurement, the initial state, the last state, the mean and std of the
+32 samples. The 32 samples are the frames of
+\texttt{langevin\_32\_walk\_\{denoise,sr\_4x,ct\}.mp4}.}
+\label{fig:step16walk32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_32_walk_traces.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_walk_traces.png}
+\caption{32 px, traces of the random walks.}
+\label{fig:step16walktraces32}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_64_walk.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_64_walk.png}
+\caption{64 px, one random walk per system ($L = 64$, 24 burn-in
+iterations, 32 recorded samples, from the latent MAP): truth,
+measurement, the initial state, the last state, the mean and std of the
+32 samples. The 32 samples are the frames of
+\texttt{langevin\_64\_walk\_\{denoise,sr\_4x,ct\}.mp4}.}
+\label{fig:step16walk64}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_64_walk_traces.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_64_walk_traces.png}
+\caption{64 px, traces of the random walks.}
+\label{fig:step16walktraces64}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_128_walk.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_128_walk.png}
+\caption{128 px, one random walk per system ($L = 64$, 24 burn-in
+iterations, 32 recorded samples, from the latent MAP): truth,
+measurement, the initial state, the last state, the mean and std of the
+32 samples. The 32 samples are the frames of
+\texttt{langevin\_128\_walk\_\{denoise,sr\_4x,ct\}.mp4}.}
+\label{fig:step16walk128}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_128_walk_traces.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_128_walk_traces.png}
+\caption{128 px, traces of the random walks.}
+\label{fig:step16walktraces128}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_256_walk.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_256_walk.png}
+\caption{256 px, one random walk per system ($L = 64$, 24 burn-in
+iterations, 32 recorded samples, from the latent MAP): truth,
+measurement, the initial state, the last state, the mean and std of the
+32 samples. The 32 samples are the frames of
+\texttt{langevin\_256\_walk\_\{denoise,sr\_4x,ct\}.mp4}.}
+\label{fig:step16walk256}
+\end{figure}}{}
+\IfFileExists{../outputs/step16_latent_langevin/figures/langevin_256_walk_traces.png}{%
+\begin{figure}[htbp]\centering
+\includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_256_walk_traces.png}
+\caption{256 px, traces of the random walks.}
+\label{fig:step16walktraces256}
 \end{figure}}{}
 \clearpage
 
@@ -4088,13 +4283,87 @@ iteration.}
         $4\times$ SR (converged in 160 iterations; 52 min for three chains
         on six systems), $L = 128$ for denoising and $2\times$ SR (30
         iterations, the last 25 on the shell; 35 min for two chains on
-        four systems), $L = 128$ and 50--90 iterations for the inpaintings
-        (not yet run to convergence). The MLE start is the mixing check;
-        it passes on denoising and, in the main run, on CT and $4\times$
-        SR. The cooled prior $\tau = 0.7$ is the option for a sharper
-        single sample at the price of a narrower posterior, tested on CT
-        and $4\times$ SR only. All PSNR numbers in this section are for
-        one image per system.
+        four systems), $L = 128$ and 70 iterations for box inpainting
+        (the \texttt{\_inpaint} run below); random inpainting is the one
+        system this sampler has not brought to the shell from the MAP. The
+        MLE start is the mixing check; it passes on denoising and, in the
+        main run, on CT and $4\times$ SR. The cooled prior $\tau = 0.7$ is
+        the option for a sharper single sample at the price of a narrower
+        posterior, tested on CT and $4\times$ SR only. All PSNR numbers in
+        this section are for one image per system.
+  \item \textbf{The inpaintings, three times longer (\texttt{\_inpaint}):
+        box converges, random does not.} Same sampler, $L = 128$, 90
+        iterations with 30 of burn-in and a 25-iteration adaptation from
+        $\varepsilon_0 = 1.5 \times 10^{-3}$, two chains from the MAP and
+        two from the MLE; batch 8, 82 min at 0.43 s per gradient
+        (Figures~\ref{fig:step16inpaint32} and \ref{fig:step16inpainttraces32}).
+        \emph{Box.} The MAP chains climb from $\|z\|$ 20.3 to 32.7 and
+        33.5 --- the traces rise linearly to about iteration 65 and then
+        level off --- having moved 32 units, their whole starting distance
+        from the shell; the energies cross the truth's at iteration 28 and
+        end at $-846$ and $-817$ against $-1021$, i.e.\ 175--204 nats above
+        it, with the residual at 1.02 and the data term ($-1380$) at the
+        noise level ($-1388$); acceptance 0.96 at $\varepsilon = 1.4$--$1.6
+        \times 10^{-3}$. The MLE chains, which start on the shell (32.7) at
+        residual 0.69, forget the noise-fitting over the first 40
+        iterations (residual 0.97--0.99 at the end) and finish at $\|z\|$
+        33.4--33.6, $U$ $-841$ and $-828$ --- within 20 nats of the MAP
+        chains --- 40--41 units from where they started. Four chains from
+        two starts 12 units apart agree on $\|z\|$ to 1 unit and on $U$ to
+        30 nats; that is the mixing check passing for box inpainting,
+        which the \texttt{\_stiff} run's 30 iterations could not show.
+        The final images are 22.0--22.9 dB from the MAP start and 21.3--21.5
+        from the MLE start (MAP 21.6), the means over 120 samples 23.8 and
+        23.5 dB ($+2.2$ and $+1.9$ over the MAP), and the two chains of a
+        pair are 0.17 RMS apart in the image. \emph{Random (70\% dropped).}
+        The MAP chains climb from $\|z\|$ 16.3 to 24.5--25.5 and stop:
+        the acceptance, 0.52 in burn-in, falls to 0.25 over the sampling
+        phase and to 0 after iteration 70, with the step size frozen at
+        $1.0$--$1.2 \times 10^{-3}$ since the adaptation ended at
+        iteration 25; after iteration 70 no proposal is accepted.
+        The energies stop at $-149$ and $-187$, 160--200 nats \emph{below}
+        the truth's $10$ --- the chains are still inside the basin, not on
+        the shell --- and the residual sits at 0.96--1.05. The MLE chains
+        do better: from 24.3 to 29.2--30.1, energies $-35$ and $-57$ and
+        still rising at the end, acceptance 0.57 at $1.1$--$1.4 \times
+        10^{-3}$. So for this system the two starts have \emph{not} met
+        (5 units and 100--130 nats apart), the MAP-start chains are not
+        samples of the posterior, and the correct statement is that random
+        inpainting at 32 px needs a smaller step than the adaptation
+        reached --- of order $5 \times 10^{-4}$, judging by the collapse ---
+        and correspondingly more iterations, or a different proposal. The
+        PSNRs are reported for completeness and not as posterior
+        statistics: samples 24.1 (MAP start) and 24.3 dB (MLE start), means
+        24.9 and 25.3 dB against the MAP's 23.5.
+  \item \textbf{One walk per system, 32 samples as frames
+        (\texttt{\_walk}).} On the request for a quick animation at each
+        rung rather than a study: a single chain from the latent MAP,
+        $L = 64$, 24 burn-in iterations and 32 recorded ones, for
+        denoising, $4\times$ SR and CT; batch 3, 24 min at 0.40 s per
+        gradient (Figure~\ref{fig:step16walk32}; the videos are the 32
+        samples at 4 frames per second). All three chains reach the shell
+        within the burn-in --- $\|z\|$ 15.6 $\to$ 30.5 (denoising), 5.7
+        $\to$ 32.5 ($4\times$ SR), 12.1 $\to$ 31.9 (CT), each having moved
+        29--32 units --- at adapted step sizes of $3.2 \times 10^{-3}$,
+        $7.8 \times 10^{-3}$ and $1.1 \times 10^{-2}$ and sampling-phase
+        acceptances of 0.97, 0.91 and 0.97 (above the 0.65 target: the
+        adaptation's 20 iterations ended before the step had grown into
+        it, so the walk is shorter per iteration than it could be).
+        Residuals 0.98, 1.08 and 0.99; energies 490 (truth 507), 431
+        (314) and 780 (634): denoising brackets the truth, $4\times$ SR and
+        CT sit 117 and 146 nats above it, the main run's picture. PSNR of
+        the last state / the samples on average / the 32-sample mean:
+        24.5 / 24.0 / 25.2 dB for denoising (MAP 23.0), 22.4 / 22.8 / 24.5
+        for $4\times$ SR (MAP 25.3), 24.4 / 25.1 / 27.0 for CT (MAP 27.6);
+        std maps 0.045, 0.056 and 0.041 on average, concentrated on the
+        lung boundaries and the mediastinum for denoising and CT and on
+        the body outline and the mediastinum for $4\times$ SR. With 32 samples from one chain
+        at these step sizes the frames are correlated (a displacement of
+        $L\varepsilon \approx 0.2$--$0.7$ per iteration against a shell of
+        radius 32) and the ``posterior mean'' is a 32-sample average, so
+        these numbers are the animation's, not the study's; they agree
+        with the main run's three-chain means (25.0, 25.6, 27.0 dB) to 0.2
+        dB on denoising and CT and fall 1.1 dB short on $4\times$ SR.
 %% STEP16_ANALYSIS_32_STIFF_MORE
 \end{itemize}
 

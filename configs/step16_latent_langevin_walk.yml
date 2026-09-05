@@ -1,0 +1,36 @@
+# step16_latent_langevin.py, fourth configuration: one random walk per system, quickly.
+# Matt: "a single random walk with 32 samples in an animation as frames for each system;
+# the priority is a fast result; 32, 64 and 128 px; denoising, 4x super-resolution, CT".
+# One chain from the latent MAP, no variants, 64 leapfrog steps per iteration (a
+# trajectory of L*eps ~ 0.2 per iteration for denoising, ~1 for CT and 4x SR), 24
+# iterations of burn-in and 32 recorded samples; the videos show the 32 samples only.
+# Batch 3: 3,584 gradients, ~0.2-0.35 s each at 32 px on a shared GPU (12-20 min); at
+# 64 and 128 px the reverse is the in-place-cache one of step 14 (`reverse: fast2`; the
+# 32-px run used the first reverse), ~2 s and ~12 s per gradient.
+# Output files carry the tag `_walk`.
+
+seed: 20260904
+output_root: outputs/step16_latent_langevin
+step14_config: configs/step14_lidc_gallery.yml
+tag: _walk
+systems: [denoise, sr_4x, ct]
+reverse: fast2
+chunk: 128
+
+chains: 1
+iterations: 56
+leapfrog: 64
+burn_in: 24
+adapt_iters: 20
+target_accept: 0.65
+eps0: 5.0e-3                    # between the 32-px main run's denoising (3e-3) and CT (1.5e-2) values
+adapt_rate: 0.2
+eps_jitter: 0.2
+
+variants:
+  - {name: posterior_from_map, init: map, temperature: 1.0, prior_scale: 1.0}
+
+video:
+  fps: 4
+  dpi: 100
+  sampling_only: true

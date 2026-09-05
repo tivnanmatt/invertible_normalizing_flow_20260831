@@ -1188,6 +1188,23 @@ class FastReverse2:
             log_q = log_q - sum_za
         return self.model.unpatchify(x), log_q
 
+    def reset(self):
+        """Zero the persistent buffers. A backward pass through a non-finite
+        objective leaves NaNs behind in them (0 x NaN in the deferred cache
+        gradient) and every later gradient is NaN while the forward stays
+        correct; a forward pass that is not back-propagated is harmless.
+        Zeroing restores the gradient (verified at 32 px). Callers with an
+        objective that can overflow should not back-propagate rows whose
+        value is not finite and call this if the gradient comes back
+        non-finite anyway."""
+        sh = self.shared
+        for t in (sh.s_tok, sh.s_za, sh.s_zb, sh.s_gza, sh.s_gzb, sh.s_gtok, sh.gK, sh.gV,
+                  sh.rec.P, sh.rec.GS, sh.rec.Q, sh.rec.GO):
+            t.zero_()
+        for gb in self.blocks:
+            gb.K.zero_()
+            gb.V.zero_()
+
 
 def check_fast_reverse2(model, batch, device, chunk, mode="graph", ref_mode="eager", seed=0):
     """Compare FastReverse2 with FastReverse on random z: max |dx|, |dlog_q|

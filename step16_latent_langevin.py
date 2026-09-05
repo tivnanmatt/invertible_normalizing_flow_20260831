@@ -11,7 +11,12 @@ Carlo on z with the energy
 T = tau = 1 the posterior itself, tau < 1 a cooled prior (latent truncation), T < 1 a
 tempered posterior: `leapfrog` steps of size eps per iteration, momentum refreshed
 every iteration, Metropolis-corrected; eps is adapted per chain during the burn-in
-towards the target acceptance and then frozen (`leapfrog: 1` is MALA). Chains start
+towards the target acceptance and then frozen (`leapfrog: 1` is MALA). With
+`mass: diag_hessian` the leapfrog uses the diagonal mass m_i = max(|diag(H)_ii|, floor)
+(H the Hessian of U at the start, Hutchinson probes with finite differences of the
+gradient), which removes the stiffness of the few latent coordinates that otherwise
+bound eps at 64 px and above. A trajectory whose energy overflows is rejected without
+back-propagating the overflow (that would corrupt the in-place reverse's caches). Chains start
 from the step-14 latent MAP (lowest-J_z restart) or from a latent maximum-likelihood
 point (Adam on the data term alone, from the MAP). All systems x variants x chains
 run as ONE batch through invlib.FastReverse; x = g(z) is recorded after every
@@ -25,7 +30,7 @@ Outputs (outputs/step16_latent_langevin/):
             langevin_{res}_{system}.mp4 (one per system)
 
 Usage:
-  python step16_latent_langevin.py --res 32 [--device cuda:0] [--iterations K --burn-in B]
+  python step16_latent_langevin.py --res 32 [--device cuda:0] [--iterations K --burn-in B --leapfrog L --mass-refresh 6,14]
   python step16_latent_langevin.py --res 32 --figures --video    # re-render from the saved files
   python step16_latent_langevin.py --collect
 """
@@ -186,19 +191,84 @@ def run(cfg, res, device, out_data, out_figs, iterations=None, burn_in=None):
     build_s = time.time() - t0
     print(f"{tag} graph build {build_s:.1f} s (batch {B}, {cfg.get('reverse', 'fast')})", flush=True)
 
-    def energy(z):
-        """U, grad U, x = g(z) and the data term, per row."""
-        z = z.detach().requires_grad_(True)
-        x, _ = fr(z)
+    def energy(z, z_safe=None):
+        """U, grad U, x = g(z), the data term and a per-row flag `bad`. A row whose U is not
+        finite (the flow overflows far outside the shell, as a runaway leapfrog goes) is
+        NOT back-propagated: a non-finite backward pass leaves FastReverse2's caches
+        corrupt (every later gradient NaN, forward still correct -- invlib.FastReverse2.reset).
+        Such rows are recomputed at `z_safe` (the chain's current state) and flagged, so the
+        batch's other rows keep their gradient; the caller rejects the flagged trajectories."""
+        zz = z.detach().requires_grad_(True)
+        x, _ = fr(zz)
         d = data_terms(x, V * C)
-        U = (d + 0.5 * (z ** 2).flatten(1).sum(-1) / tau ** 2) / temp
-        (g,) = torch.autograd.grad(U.sum(), z)
-        return U.detach(), g, x.detach(), d.detach()
+        U = (d + 0.5 * (zz ** 2).flatten(1).sum(-1) / tau ** 2) / temp
+        bad = ~torch.isfinite(U)
+        if bool(bad.any()):
+            if z_safe is None:
+                raise FloatingPointError(f"{tag} energy not finite on rows {bad.nonzero().flatten().tolist()}")
+            zz = torch.where(bad.view(B, 1, 1), z_safe, z).detach().requires_grad_(True)
+            x, _ = fr(zz)
+            d = data_terms(x, V * C)
+            U = (d + 0.5 * (zz ** 2).flatten(1).sum(-1) / tau ** 2) / temp
+            if not bool(torch.isfinite(U).all()):
+                raise FloatingPointError(f"{tag} energy not finite at the chain's own state")
+        (g,) = torch.autograd.grad(U.sum(), zz)
+        if not bool(torch.isfinite(g).all()):                                  # inf - inf inside the backward
+            fr_reset()
+            bad = bad | ~torch.isfinite(g).flatten(1).all(-1)
+            g = torch.where(bad.view(B, 1, 1), torch.zeros_like(g), g)
+        return U.detach(), g, x.detach(), d.detach(), bad
+
+    n_reset = [0]
+
+    def fr_reset():
+        n_reset[0] += 1
+        if hasattr(fr, "reset"):
+            fr.reset()
+        print(f"{tag} non-finite gradient: FastReverse buffers reset ({n_reset[0]} so far)", flush=True)
 
     with torch.no_grad():
         x0 = torch.cat([s10.draw_samples(prior, z0[i:i + 32]) for i in range(0, B, 32)])
     z = z0.clone()
-    U, g, x, d = energy(z)
+    U, g, x, d, _ = energy(z)
+
+    # Mass matrix. The curvature of U is concentrated in a few latent coordinates (at 64 px:
+    # median diag(H) ~ 1, but 1e5--1e6 on a handful of late-token coordinates), and the
+    # stability limit eps < 2/sqrt|lambda|_max of the unit-mass leapfrog is set by those.
+    # `mass: diag_hessian` uses m_i = max(|diag(H)_ii|, floor), estimated by Hutchinson's
+    # trick with finite differences of the gradient (one gradient per probe), at the start
+    # and again at the iterations in `mass_refresh` (all inside the burn-in; the sampling
+    # phase runs with a fixed mass). The absolute value matters: U is not convex at the
+    # MAP (at 32 px a third of the diagonal estimates are negative, down to -3.5e3), and a
+    # negative-curvature coordinate is as stiff for the leapfrog as a positive one
+    # (exponential instead of oscillatory growth) -- with the positive part alone, eps 0.1
+    # in the scaled coordinates blew up in two steps, with |diag| eps 0.05 conserves H to
+    # 0.1 over 8 steps at 32 px. Leapfrog with mass m: p ~ N(0, m), K = p^2 / 2m,
+    # z += eps p / m -- HMC in the rescaled coordinates z sqrt(m), where |curvature| is
+    # ~1 in every coordinate.
+    mass_gen = torch.Generator(device=device).manual_seed(cfg["seed"] + 1)
+
+    def estimate_mass(z, g, probes, delta, floor):
+        acc_ = torch.zeros_like(z)
+        for _ in range(probes):
+            v = torch.randint(0, 2, z.shape, generator=mass_gen, device=device).float() * 2 - 1
+            _, gv, _, _, _ = energy(z + delta * v, z)
+            acc_ += v * (gv - g) / delta
+        return (acc_ / probes).abs().clamp(min=floor)
+
+    mass_cfg = cfg.get("mass", "unit")
+    if mass_cfg == "diag_hessian":
+        m_probes, m_delta, m_floor = int(cfg.get("mass_probes", 32)), float(cfg.get("mass_delta", 1e-3)), float(cfg.get("mass_floor", 1.0))
+        m_refresh = [int(v_) for v_ in cfg.get("mass_refresh", [])]
+        t1 = time.time()
+        m = estimate_mass(z, g, m_probes, m_delta, m_floor)
+        print(f"{tag} mass matrix (diag Hessian, {m_probes} probes, {time.time() - t1:.0f} s): per system median / p99 / max "
+              + " ".join(f"{p_['name']}[{float(m[rows_of(s, 0)].median()):.1f} / {float(m[rows_of(s, 0)].flatten().kthvalue(int(0.99 * m[rows_of(s, 0)].numel())).values):.0f} / {float(m[rows_of(s, 0)].max()):.0f}]"
+                         for s, p_ in enumerate(probs)), flush=True)
+    elif mass_cfg == "unit":
+        m, m_refresh = torch.ones_like(z), []
+    else:
+        raise ValueError(f"mass: {mass_cfg}")
     log_eps = torch.full((B,), math.log(float(cfg["eps0"])), device=device)
     rate, target, jit = float(cfg["adapt_rate"]), float(cfg["target_accept"]), float(cfg.get("eps_jitter", 0.0))
     noise_gen = torch.Generator(device=device).manual_seed(cfg["seed"])
@@ -209,22 +279,31 @@ def run(cfg, res, device, out_data, out_figs, iterations=None, burn_in=None):
     t_all = time.time()
     for k in range(K):
         t1 = time.time()
+        if k in m_refresh and k < K_burn:
+            m = estimate_mass(z, g, m_probes, m_delta, m_floor)
+            print(f"{tag} iter {k:4d}: mass matrix refreshed; max per system "
+                  + " ".join(f"{p_['name']} {float(m[rows_of(s, 0)].max()):.0f}" for s, p_ in enumerate(probs)), flush=True)
         eps = log_eps.exp()
         if jit > 0:
             eps = eps * (1 + jit * (2 * torch.rand(B, generator=noise_gen, device=device) - 1))
         e3 = eps.view(B, 1, 1)
-        p = torch.randn(z.shape, generator=noise_gen, device=device)
-        H0 = U + 0.5 * (p ** 2).flatten(1).sum(-1)
+        p = torch.randn(z.shape, generator=noise_gen, device=device) * m.sqrt()    # p ~ N(0, m)
+        H0 = U + 0.5 * (p ** 2 / m).flatten(1).sum(-1)
         zc, gc = z, g
+        bad = torch.zeros(B, dtype=torch.bool, device=device)
         p = p - 0.5 * e3 * gc                                                   # leapfrog: half kick,
         for l in range(L):
-            zc = zc + e3 * p                                                    # drift,
-            Uc, gc, xc, dc = energy(zc)
+            zc = zc + e3 * p / m                                                # drift,
+            zc = torch.where(bad.view(B, 1, 1), z, zc)                          # (runaway rows idle at the chain's state)
+            Uc, gc, xc, dc, bad_l = energy(zc, z)
+            bad = bad | bad_l
             p = p - (e3 if l < L - 1 else 0.5 * e3) * gc                        # kick (half at the end)
-        H1 = Uc + 0.5 * (p ** 2).flatten(1).sum(-1)
+        H1 = Uc + 0.5 * (p ** 2 / m).flatten(1).sum(-1)
         log_alpha = H0 - H1
-        finite = torch.isfinite(log_alpha) & torch.isfinite(gc).flatten(1).all(-1)
+        finite = torch.isfinite(log_alpha) & torch.isfinite(gc).flatten(1).all(-1) & ~bad
         log_alpha = torch.where(finite, log_alpha, torch.full_like(log_alpha, -float("inf")))
+        if bool(bad.any()):
+            print(f"{tag} iter {k:4d}: runaway trajectory rejected on rows {bad.nonzero().flatten().tolist()}", flush=True)
         u = torch.rand(B, generator=noise_gen, device=device)
         acc = u.log() < log_alpha
         a_prob = log_alpha.clamp(max=0).exp()
@@ -283,6 +362,7 @@ def run(cfg, res, device, out_data, out_figs, iterations=None, burn_in=None):
                 n_samples=int(F_.shape[0] * F_.shape[1]), std_mean=float(std.mean()),
                 z_norm_init=[float(v_) for v_ in z0[r].flatten(1).norm(dim=-1)],
                 dist_from_init=[float(v_) for v_ in (z[r] - z0[r]).flatten(1).norm(dim=-1)],
+                mass_max=[float(v_) for v_ in m[r].flatten(1).max(-1).values],
                 pairwise_rms=float(((xs[:, None] - xs[None]) ** 2).mean((2, 3, 4)).sqrt().sum() / (C * (C - 1))),
                 max_abs=[float(v_) for v_ in xs.flatten(1).abs().max(-1).values]))
             rr = rows[-1]
@@ -296,6 +376,8 @@ def run(cfg, res, device, out_data, out_figs, iterations=None, burn_in=None):
                     iterations=K, leapfrog=L, burn_in=K_burn, adapt_iters=K_adapt, eps0=cfg["eps0"], target_accept=target,
                     eps_jitter=jit, variants=variants, mle=mle_stats, seconds=total, iter_seconds=float(np.mean(ts)),
                     grad_seconds=float(np.mean(ts)) / L, graph_build_seconds=build_s, reverse=cfg.get("reverse", "fast"),
+                    mass=mass_cfg, mass_probes=(m_probes if mass_cfg == "diag_hessian" else None), mass_refresh=m_refresh,
+                    n_reverse_resets=n_reset[0],
                     indices=[gal["indices"][i] for i in keep_idx], systems=[sp["name"] for sp in systems], rows=rows)
     json.dump(res_json, open(out_data / f"{stem(cfg, res)}.json", "w"), indent=1)
     np.savez_compressed(out_data / f"{stem(cfg, res)}_frames.npz", frames=frames, **{f"trace_{k}": v_ for k, v_ in tr.items()})
@@ -525,7 +607,8 @@ def collect(cfg, out_data):
             parts.append(f"{_tex(r0['model'])} (\\#{r0['index']}): {vs}")
         lines.append(f"\\noindent\\texttt{{{_tex(p.stem)}}}: {J['res']}$\\times${J['res']} ($n={J['n']}$, $\\sqrt{{n}}={J['sqrt_n']:.0f}$; "
                      f"batch {J['batch']}, {J['chains']} chains, {J['iterations']} HMC iterations $\\times$ {J['leapfrog']} leapfrog steps, "
-                     f"burn-in {J['burn_in']}, {J['grad_seconds']:.2f} s per gradient, {J['seconds'] / 60:.0f} min).\\\\\n"
+                     f"burn-in {J['burn_in']}, {J['grad_seconds']:.2f} s per gradient, {J['seconds'] / 60:.0f} min"
+                     + (f"; mass matrix diag(H) from {J['mass_probes']} probes" if J.get('mass') == 'diag_hessian' else "") + ").\\\\\n"
                      + " \\\\\n".join(parts) + ".")
     (out_data / "summary.tex").write_text("\n\n".join(lines) + "\n")
     return lines
@@ -538,6 +621,8 @@ def main(argv=None):
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--iterations", type=int, default=0)
     ap.add_argument("--burn-in", type=int, default=0)
+    ap.add_argument("--leapfrog", type=int, default=0, help="override the config's leapfrog steps (recorded in the json)")
+    ap.add_argument("--mass-refresh", default="", help="override the config's mass_refresh iterations, comma-separated (recorded in the json)")
     ap.add_argument("--figures", action="store_true", help="re-render the figures from the saved files")
     ap.add_argument("--video", action="store_true", help="re-render the videos from the saved files")
     ap.add_argument("--only", nargs="*", help="systems to render videos for")
@@ -548,6 +633,10 @@ def main(argv=None):
     out_data, out_figs = out_root / "data", out_root / "figures"
     out_data.mkdir(parents=True, exist_ok=True)
     out_figs.mkdir(parents=True, exist_ok=True)
+    if args.leapfrog:
+        cfg["leapfrog"] = args.leapfrog
+    if args.mass_refresh:
+        cfg["mass_refresh"] = [int(v) for v in args.mass_refresh.split(",")]
     if args.res and not (args.figures or args.video):
         run(cfg, args.res, torch.device(args.device), out_data, out_figs, iterations=args.iterations, burn_in=args.burn_in)
         figures(cfg, args.res, out_data, out_figs)

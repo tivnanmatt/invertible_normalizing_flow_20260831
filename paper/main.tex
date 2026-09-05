@@ -3932,6 +3932,90 @@ blue, prior-sample initialisation in orange.}
         systems) --- 3,840 gradients on a batch of 16, sized to finish in
         about 40 minutes next to the 128-px training. Chains of one (system,
         variant) share the initial state and differ in their noise.
+  \item \textbf{Deviation, recorded: a mass matrix for the walks
+        (\texttt{\_walk}, 64 px and above).} The first 64-px walk, unit
+        mass and $\varepsilon_0 = 5 \times 10^{-3}$, accepted nothing in
+        ten iterations (50 min) while the adaptation took $\varepsilon$
+        from $5.9 \times 10^{-3}$ to $1.5 \times 10^{-3}$. Two probes
+        explain it (\texttt{scratch/probe\_hmc64.py},
+        \texttt{probe\_hess64.py}, \texttt{probe\_hess\_precond.py}; their
+        logs sit beside them). (a) The integrator is right: the energy
+        error of one 8-step trajectory from the 64-px MAP falls as
+        $\varepsilon^2$ ($\Delta H$ = 0.16 / 0.04 / 0.00 for denoising at
+        $\varepsilon = 10^{-3}, 5 \times 10^{-4}, 2.5 \times 10^{-4}$) and
+        explodes above $10^{-3}$ ($7.8 \times 10^4$ at $2 \times 10^{-3}$).
+        (b) The stiffness is a few coordinates: the top eigenvalue of the
+        Hessian of $U$ at the 64-px MAPs, by power iteration on
+        finite differences of the gradient, is $1.5 \times 10^6$
+        (denoising), $2.4 \times 10^5$ ($4\times$ SR) and $3.8 \times
+        10^6$ (CT), i.e.\ a unit-mass stability limit $\varepsilon < 2 /
+        \sqrt{\lambda} = 1.6 \times 10^{-3}$, $4.1 \times 10^{-3}$ and
+        $1.0 \times 10^{-3}$, and the eigenvector lives on 2--6 latent
+        coordinates of the last tokens (dimension 12 of tokens 236--254;
+        the median diagonal entry is $\approx 1$, the largest $10^5$--$1.8
+        \times 10^6$). At 32 px the same picture at $\lambda = 1.3 \times
+        10^5$ / $2.7 \times 10^4$ / $1.6 \times 10^4$, matching the
+        step sizes the unit-mass walk adapted to. So the walks use a
+        diagonal mass matrix, $m_i = \max(|H_{ii}|, 1)$, with $H_{ii}$
+        estimated by Hutchinson's trick (32 Rademacher probes, each one
+        finite difference of the gradient at $\delta = 10^{-3}$: 32
+        gradients) at the start and once more at burn-in iteration 8;
+        the leapfrog is then $p \sim \mathcal{N}(0, m)$, $K = \sum_i
+        p_i^2 / 2 m_i$, $z \mathrel{+}= \varepsilon\, p / m$, and
+        $\varepsilon$ lives in the rescaled coordinates $z\sqrt{m}$
+        ($\varepsilon_0 = 0.05$). The absolute value is not cosmetic: $U$
+        is not convex at the MAP --- a third of the diagonal estimates are
+        negative, down to $-3.5 \times 10^3$ at 32 px and $-7 \times 10^4$
+        at 64 px --- and a negative-curvature coordinate is as stiff for
+        the leapfrog as a positive one (exponential rather than
+        oscillatory growth); with the positive part alone
+        ($\max(H_{ii}, 1)$) a trajectory at $\varepsilon = 0.1$ blew up in
+        two steps. Power iteration on the preconditioned Hessian
+        $M^{-1/2} H M^{-1/2}$ gives a top $|\lambda|$ of 167 / 133 / 148
+        at 32 px and 167 / 281 / 191 at 64 px, i.e.\ $\varepsilon <
+        0.12$--$0.17$ in the rescaled coordinates at both resolutions
+        --- a factor 30 (32 px, denoising) to 100 (64 px, denoising and
+        CT) on the unit-mass limit --- and at 32 px a trajectory at
+        $\varepsilon = 0.05$ conserves $H$ to 0.1 over 8 steps while
+        moving 0.8--1.1 per step in $z$ where the unit-mass walk at $5
+        \times 10^{-3}$ moved 0.16. The 32-px walk was re-run with the
+        mass matrix (the unit-mass one is kept as
+        \texttt{langevin\_32\_walk\_unitmass\_*}); the 64- and 128-px walks
+        ran with it from the start. The 64-px run showed that the
+        stiffness grows as the chains climb from the MAP to the shell
+        (Analysis), so the 128-px walk, to keep its cost near 5 h,
+        deviates from the config on the command line ($L = 32$, 52
+        iterations, 20 of them burn-in, the mass re-estimated at
+        iterations 6 and 14 instead of 8: \texttt{--leapfrog 32
+        --iterations 52 --burn-in 20 --mass-refresh 6,14}, all recorded
+        in its json); the last refresh leaves six adaptation iterations
+        to re-tune the step to the new mass.
+  \item \textbf{Deviation, recorded: a non-finite backward pass corrupts
+        the in-place reverse.} Diagnosing the stall exposed a second
+        fault. A backward pass of \texttt{invlib.FastReverse2} through a
+        non-finite objective leaves NaNs in its persistent buffers (a $0
+        \times \mathrm{NaN}$ in the deferred cache gradient), after which
+        every gradient is NaN while the forward stays correct; a forward
+        pass that is not back-propagated is harmless, and zeroing the
+        buffers (\texttt{FastReverse2.reset()}) restores the gradient
+        (\texttt{scratch/probe\_fr2\_nan.py}). Any \texttt{fast2} chain
+        whose first trajectory overflowed was therefore dead from
+        iteration 0, which is part of the 64-px stall above (its first
+        iteration at $\varepsilon = 5.9 \times 10^{-3}$ was four times
+        the stability limit). The sampler now checks the energy before
+        back-propagating: rows whose $U$ is not finite are recomputed at
+        the chain's current state, flagged, and their trajectory is
+        rejected (``runaway trajectory rejected'' in the log); a
+        non-finite gradient in spite of that resets the buffers and is
+        counted (\texttt{n\_reverse\_resets} in the json). Tested by a
+        3-iteration run at $\varepsilon_0 = 1$: one reset, every
+        trajectory rejected, the mass refresh at iteration 1 finite and
+        consistent with the probes. The earlier 32-px runs (main,
+        \texttt{\_stiff}, \texttt{\_inpaint}) used \texttt{FastReverse},
+        which has no persistent buffers, so their numbers stand; the
+        random-inpainting collapse of the \texttt{\_inpaint} run is a
+        finite, huge $\Delta H$ (acceptance probabilities $10^{-5}$ to
+        $10^{-41}$ after iteration 70), not this fault.
   \item \textbf{What is recorded.} After every iteration: $U$, the data
         term, $\|z\|$, PSNR of $g_\theta(z)$, acceptance and its
         probability, $\varepsilon$, and the image itself (fp16) for every
@@ -4033,7 +4117,8 @@ two chains).}
 \begin{figure}[htbp]\centering
 \includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_32_walk.png}
 \caption{32 px, one random walk per system ($L = 64$, 24 burn-in
-iterations, 32 recorded samples, from the latent MAP): truth,
+iterations, 32 recorded samples, from the latent MAP, with the diagonal
+mass matrix of the Methods): truth,
 measurement, the initial state, the last state, the mean and std of the
 32 samples. The 32 samples are the frames of
 \texttt{langevin\_32\_walk\_\{denoise,sr\_4x,ct\}.mp4}.}
@@ -4049,7 +4134,8 @@ measurement, the initial state, the last state, the mean and std of the
 \begin{figure}[htbp]\centering
 \includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_64_walk.png}
 \caption{64 px, one random walk per system ($L = 64$, 24 burn-in
-iterations, 32 recorded samples, from the latent MAP): truth,
+iterations, 32 recorded samples, from the latent MAP, with the diagonal
+mass matrix of the Methods): truth,
 measurement, the initial state, the last state, the mean and std of the
 32 samples. The 32 samples are the frames of
 \texttt{langevin\_64\_walk\_\{denoise,sr\_4x,ct\}.mp4}.}
@@ -4064,8 +4150,10 @@ measurement, the initial state, the last state, the mean and std of the
 \IfFileExists{../outputs/step16_latent_langevin/figures/langevin_128_walk.png}{%
 \begin{figure}[htbp]\centering
 \includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_128_walk.png}
-\caption{128 px, one random walk per system ($L = 64$, 24 burn-in
-iterations, 32 recorded samples, from the latent MAP): truth,
+\caption{128 px, one random walk per system ($L = 32$, 20 burn-in
+iterations, 32 recorded samples, from the latent MAP, with the diagonal
+mass matrix of the Methods refreshed at iterations 6 and 14; the shorter
+trajectory halves the cost at this rung, see the Analysis): truth,
 measurement, the initial state, the last state, the mean and std of the
 32 samples. The 32 samples are the frames of
 \texttt{langevin\_128\_walk\_\{denoise,sr\_4x,ct\}.mp4}.}
@@ -4081,7 +4169,8 @@ measurement, the initial state, the last state, the mean and std of the
 \begin{figure}[htbp]\centering
 \includegraphics[width=\textwidth]{outputs/step16_latent_langevin/figures/langevin_256_walk.png}
 \caption{256 px, one random walk per system ($L = 64$, 24 burn-in
-iterations, 32 recorded samples, from the latent MAP): truth,
+iterations, 32 recorded samples, from the latent MAP, with the diagonal
+mass matrix of the Methods): truth,
 measurement, the initial state, the last state, the mean and std of the
 32 samples. The 32 samples are the frames of
 \texttt{langevin\_256\_walk\_\{denoise,sr\_4x,ct\}.mp4}.}
@@ -4336,34 +4425,108 @@ measurement, the initial state, the last state, the mean and std of the
         statistics: samples 24.1 (MAP start) and 24.3 dB (MLE start), means
         24.9 and 25.3 dB against the MAP's 23.5.
   \item \textbf{One walk per system, 32 samples as frames
-        (\texttt{\_walk}).} On the request for a quick animation at each
-        rung rather than a study: a single chain from the latent MAP,
-        $L = 64$, 24 burn-in iterations and 32 recorded ones, for
-        denoising, $4\times$ SR and CT; batch 3, 24 min at 0.40 s per
-        gradient (Figure~\ref{fig:step16walk32}; the videos are the 32
-        samples at 4 frames per second). All three chains reach the shell
-        within the burn-in --- $\|z\|$ 15.6 $\to$ 30.5 (denoising), 5.7
-        $\to$ 32.5 ($4\times$ SR), 12.1 $\to$ 31.9 (CT), each having moved
-        29--32 units --- at adapted step sizes of $3.2 \times 10^{-3}$,
-        $7.8 \times 10^{-3}$ and $1.1 \times 10^{-2}$ and sampling-phase
-        acceptances of 0.97, 0.91 and 0.97 (above the 0.65 target: the
-        adaptation's 20 iterations ended before the step had grown into
-        it, so the walk is shorter per iteration than it could be).
-        Residuals 0.98, 1.08 and 0.99; energies 490 (truth 507), 431
-        (314) and 780 (634): denoising brackets the truth, $4\times$ SR and
-        CT sit 117 and 146 nats above it, the main run's picture. PSNR of
-        the last state / the samples on average / the 32-sample mean:
-        24.5 / 24.0 / 25.2 dB for denoising (MAP 23.0), 22.4 / 22.8 / 24.5
-        for $4\times$ SR (MAP 25.3), 24.4 / 25.1 / 27.0 for CT (MAP 27.6);
-        std maps 0.045, 0.056 and 0.041 on average, concentrated on the
-        lung boundaries and the mediastinum for denoising and CT and on
-        the body outline and the mediastinum for $4\times$ SR. With 32 samples from one chain
-        at these step sizes the frames are correlated (a displacement of
+        (\texttt{\_walk}), 32 px.} On the request for a quick animation
+        at each rung rather than a study: a single chain from the latent
+        MAP, $L = 64$, 24 burn-in iterations and 32 recorded ones, for
+        denoising, $4\times$ SR and CT, batch 3
+        (Figure~\ref{fig:step16walk32}; the videos are the 32 samples at 4
+        frames per second). The run was made twice. The first, with unit
+        mass, is kept as \texttt{langevin\_32\_walk\_unitmass\_*}: its
+        chains reached the shell only at the end of the burn-in
+        ($\|z\|$ 15.6 $\to$ 30.5, 5.7 $\to$ 32.5, 12.1 $\to$ 31.9 over 24
+        iterations) at adapted steps of $3.2 \times 10^{-3}$, $7.8 \times
+        10^{-3}$ and $1.1 \times 10^{-2}$ --- a displacement of
         $L\varepsilon \approx 0.2$--$0.7$ per iteration against a shell of
-        radius 32) and the ``posterior mean'' is a 32-sample average, so
-        these numbers are the animation's, not the study's; they agree
-        with the main run's three-chain means (25.0, 25.6, 27.0 dB) to 0.2
-        dB on denoising and CT and fall 1.1 dB short on $4\times$ SR.
+        radius 32 --- so the 32 frames were strongly correlated (lag-one
+        autocorrelation of the pixels 0.55, 0.56 and 0.42, i.e.\ about
+        9--13 effectively independent frames) and its ``posterior means''
+        (25.2, 24.5, 27.0 dB) were averages of a short segment of the
+        chain. The same step sizes made the 64-px walk stall (next
+        bullet), which is what led to the mass matrix of the Methods. The
+        second run, with $m_i = \max(|\partial_i^2 U|, 1)$, is the one in
+        the figure: the mass estimate took 17 s (32 probes; median /
+        99th-percentile / maximum 20.8 / 2635 / 39728 for denoising, 2.9
+        / 269 / 15066 for $4\times$ SR, 4.0 / 401 / 3297 for CT; refreshed
+        at iteration 8 with maxima 176886, 1872 and 676 --- the denoising
+        posterior is stiffest in a handful of coordinates); iteration 0
+        was accepted by all three chains at $\varepsilon \approx 0.06$ in
+        the mass-scaled coordinates and all three were on the shell by
+        iteration 10 ($\|z\|$ 30.5, 31.6, 32.7), a quarter of the
+        unit-mass burn-in. Adapted step sizes $8.2 \times 10^{-2}$, $4.7
+        \times 10^{-2}$ and $8.3 \times 10^{-2}$; acceptance 0.96 / 0.97,
+        0.62 / 0.78 and 0.88 / 0.78 (burn-in / sampling; $4\times$ SR fell
+        to 0.2 over a ten-iteration window around iteration 17 and the
+        adaptation halved its step); one runaway trajectory ($4\times$ SR,
+        iteration 30) was rejected by the overflow guard and no buffer
+        reset was needed. Residuals 1.01, 0.92 and 0.96; energies 553
+        (truth 507), 412 (314) and 781 (634), i.e.\ 46, 98 and 147 nats
+        above the truth; the unit-mass walk's denoising chain had ended
+        at 490, below the truth, and the main run's MAP-start denoising
+        chains at 223--289 with $\|z\|$ 22--25 after 160 iterations
+        (claim (iv) above), so those chains had not reached the energies
+        the mass-matrix chain reaches in ten iterations. PSNR
+        of the last state / the samples on average / the 32-sample mean:
+        24.8 / 24.4 / 26.8 dB for denoising (MAP 23.0), 22.8 / 23.0 / 25.3
+        for $4\times$ SR (MAP 25.3), 24.8 / 25.1 / 27.0 for CT (MAP 27.6);
+        std maps 0.058, 0.063 and 0.042 on average (0.045, 0.056, 0.041
+        with unit mass), concentrated on the lung boundaries and the
+        mediastinum for denoising and CT and on the body outline and the
+        mediastinum for $4\times$ SR. The frames are now nearly
+        independent: lag-one pixel autocorrelation 0.09, 0.07 and 0.08,
+        and the r.m.s.\ difference between consecutive frames (0.108,
+        0.108, 0.082) is at or above $\sqrt{2}$ times the std map, the
+        value for independent draws. The 32-sample means agree with the
+        main run's three-chain means (25.0, 25.6, 27.0 dB) to 0.1 dB on
+        CT and fall 0.3 dB short on $4\times$ SR; on denoising the walk's
+        26.8 dB is 1.8 dB above the main run's 25.0, which was the mean of
+        chains that had stayed near the MAP --- a mean of shell samples
+        against a mean of near-MAP states, not a like-for-like comparison.
+        Wall time 44 min at 0.73 s per gradient, sharing the GPU with the
+        64-px walk and the 128-px gallery (0.52 s per gradient alone).
+  \item \textbf{The walk at 64 px (\texttt{\_walk}, $n = 4096$, shell
+        radius 64): moving, but not mixed.} Same protocol with the mass
+        matrix from the start (Figure~\ref{fig:step16walk64}, traces in
+        Figure~\ref{fig:step16walktraces64}); 4.7 h at 4.8 s per gradient,
+        sharing the GPU with the 128-px gallery throughout. The unit-mass
+        attempt at this rung had accepted nothing (Methods); with the
+        mass matrix (32 probes, 217 s; median / 99th percentile / maximum
+        29 / 10013 / 1154439 for denoising, 4.4 / 1153 / 94112 for
+        $4\times$ SR, 33 / 25247 / 784911 for CT) iteration 0 was accepted
+        by all three chains at $\varepsilon \approx 0.06$ and moved them
+        from $\|z\|$ 27.6, 22.4 and 49.2 to 42.6, 46.2 and 57.1; by
+        iteration 10 they were at 54.7, 58.5 and 65.6. The refresh at
+        iteration 8 found the stiffness had grown as the chains climbed
+        (maxima 2215978, 372752 and 4017214, two to five times the values
+        at the MAP), and it kept growing: the adapted step sizes fell
+        through the burn-in ($3.6 \times 10^{-2}$, $3.4 \times 10^{-2}$,
+        $6.7 \times 10^{-2}$ at its end) and once the adaptation stopped
+        at iteration 20 the acceptance fell with them --- 0.50 / 0.44,
+        0.42 / 0.19 and 0.79 / 0.62 (burn-in / sampling); the $4\times$ SR
+        chain's median acceptance probability in the sampling phase is
+        0.00, i.e.\ most of its trajectories overshoot outright, and two
+        of them ran away (iterations 26 and 42; rejected by the guard, no
+        reset). So the 32 recorded frames contain 14 (denoising), 7
+        ($4\times$ SR) and 20 (CT) distinct states, with lag-one pixel
+        autocorrelations 0.58, 0.76 and 0.56: the videos at this rung
+        show a chain that moves, not independent draws. Where the chains
+        are: CT on the shell ($\|z\|$ 65.2) with a residual 1.17 times
+        the truth's, still falling in the trace (1.39 at the MAP); $4\times$
+        SR at 62.8, residual 0.98; denoising at 57.7 --- six units short
+        of the shell and 145 nats \emph{below} the truth's energy
+        (1782 against 1927), i.e.\ still a near-MAP state, as the 32-px
+        main run's denoising chains were. Energies for $4\times$ SR and
+        CT, 1566 (truth 1199) and 4314 (3357), are 367 and 957 nats above
+        the truth. PSNR of the last state / the samples on average / the
+        32-sample mean: 24.5 / 24.5 / 25.6 dB for denoising (MAP 25.2),
+        22.9 / 23.1 / 23.4 for $4\times$ SR (MAP 23.5), 26.3 / 26.3 /
+        27.1 for CT (MAP 25.6); std maps 0.037, 0.025, 0.022 on average,
+        smaller than at 32 px because fewer distinct states enter them.
+        The lesson taken into the 128-px run: the mass has to be
+        re-estimated late in the burn-in, after the chains have climbed,
+        with adaptation iterations left after the last refresh
+        (\texttt{--mass-refresh 6,14} of a 20-iteration burn-in, below).
+%% STEP16_ANALYSIS_WALK_64
+%% STEP16_ANALYSIS_WALK_128
 %% STEP16_ANALYSIS_32_STIFF_MORE
 \end{itemize}
 

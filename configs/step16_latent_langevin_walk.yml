@@ -1,12 +1,25 @@
 # step16_latent_langevin.py, fourth configuration: one random walk per system, quickly.
 # Matt: "a single random walk with 32 samples in an animation as frames for each system;
 # the priority is a fast result; 32, 64 and 128 px; denoising, 4x super-resolution, CT".
-# One chain from the latent MAP, no variants, 64 leapfrog steps per iteration (a
-# trajectory of L*eps ~ 0.2 per iteration for denoising, ~1 for CT and 4x SR), 24
+# One chain from the latent MAP, no variants, 64 leapfrog steps per iteration, 24
 # iterations of burn-in and 32 recorded samples; the videos show the 32 samples only.
-# Batch 3: 3,584 gradients, ~0.2-0.35 s each at 32 px on a shared GPU (12-20 min); at
-# 64 and 128 px the reverse is the in-place-cache one of step 14 (`reverse: fast2`; the
-# 32-px run used the first reverse), ~2 s and ~12 s per gradient.
+#
+# Mass matrix. With unit mass the 64-px chains accepted nothing at eps 6e-3 -> 1.5e-3 for
+# 10 iterations (50 min) and would have needed eps ~ 1e-3 (CT) to move at all: the top
+# Hessian eigenvalue of U at the 64-px MAPs is 1.5e6 (denoise), 2.4e5 (4x SR), 3.8e6 (CT)
+# -- eps_stab = 2/sqrt(lambda) = 1.6e-3, 4.1e-3, 1.0e-3 -- and its eigenvector lives on
+# 2-6 latent coordinates of the last tokens (median diag(H) ~ 1). So the leapfrog runs
+# with the diagonal mass m_i = max(|diag(H)_ii|, 1), estimated by Hutchinson probes with
+# finite differences of the gradient (32 gradients) at the start and refreshed once at
+# iteration 8 of the burn-in; eps then starts at 0.05 in the scaled coordinates and
+# adapts (the positive part of diag(H) alone is not enough: U is not convex at the MAP,
+# and the negative-curvature coordinates, down to -3.5e3 at 32 px, are as stiff). The
+# first 32-px walk (unit mass, eps0 5e-3, adapted to 3e-3 -- 1.1e-2) is archived as
+# *_walk_unitmass*. A run whose first mass-matrix attempt blew up (eps0 0.1 with the
+# positive part; a non-finite trajectory then corrupted the in-place reverse's caches,
+# now guarded) was discarded.
+# At 64 and 128 px the reverse is the in-place-cache one of step 14 (`reverse: fast2`),
+# ~4.5 s (shared GPU) and ~12 s per gradient.
 # Output files carry the tag `_walk`.
 
 seed: 20260904
@@ -23,9 +36,15 @@ leapfrog: 64
 burn_in: 24
 adapt_iters: 20
 target_accept: 0.65
-eps0: 5.0e-3                    # between the 32-px main run's denoising (3e-3) and CT (1.5e-2) values
+eps0: 0.05                      # in the mass-scaled coordinates (|curvature| ~ 1 per coordinate)
 adapt_rate: 0.2
 eps_jitter: 0.2
+
+mass: diag_hessian
+mass_probes: 32
+mass_delta: 1.0e-3
+mass_floor: 1.0
+mass_refresh: [8]
 
 variants:
   - {name: posterior_from_map, init: map, temperature: 1.0, prior_scale: 1.0}
